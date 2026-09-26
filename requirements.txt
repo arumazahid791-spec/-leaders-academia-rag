@@ -4,3 +4,6 @@ faiss-cpu
 google-genai
 gradio
 numpy
+fastapi
+uvicorn
+requests
