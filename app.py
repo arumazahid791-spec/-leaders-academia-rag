@@ -3,9 +3,10 @@ Leaders Academia — RAG Chatbot + WhatsApp Webhook
 Runs on Railway (or any host with a Procfile-style start command).
 
 Pipeline: PDF -> text chunks -> free local embeddings -> FAISS index ->
-Gemini (context-grounded answer) -> served two ways from ONE app:
+Gemini (context-grounded answer) -> served three ways from ONE app:
   1) Gradio chat UI (browser testing)        -> GET  /
   2) WhatsApp Cloud API webhook (real chats) -> GET/POST /webhook
+  3) Privacy Policy page (for Meta App Publish requirement) -> GET /privacy
 """
 
 import os
@@ -13,7 +14,7 @@ import time
 
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse
 import uvicorn
 
 from pypdf import PdfReader
@@ -78,7 +79,7 @@ index.add(chunk_embeddings)
 print(f"Knowledge base ready: {len(chunks)} chunks indexed.")
 
 
-# ---------- RAG logic (unchanged from your original) ----------
+# ---------- RAG logic (unchanged) ----------
 def retrieve_chunks(query, top_k=4):
     query_vec = embed_model.encode([query], convert_to_numpy=True)
     _, indices = index.search(query_vec, top_k)
@@ -91,7 +92,6 @@ def wants_human(text):
 
 
 def rag_answer(user_question, max_retries=3):
-    # Direct handoff — skip the model entirely for this case
     if wants_human(user_question):
         return (
             "Zaroor! Aap hamari team se seedha rabta kar sakte hain:\n"
@@ -133,7 +133,7 @@ Reply clearly and concisely."""
             error_text = str(e)
             if "429" in error_text or "quota" in error_text.lower():
                 if attempt < max_retries - 1:
-                    time.sleep(15)  # back off and retry once on rate limit
+                    time.sleep(15)
                     continue
                 return (
                     "Maaf kijiye, is waqt AI system busy hai (free usage "
@@ -156,9 +156,54 @@ demo = gr.ChatInterface(
 
 
 # ======================================================================
-# NEW: FastAPI app — hosts the WhatsApp webhook and mounts the Gradio UI
+# FastAPI app — hosts the WhatsApp webhook, privacy policy, and mounts Gradio
 # ======================================================================
 app = FastAPI()
+
+
+PRIVACY_POLICY_HTML = """
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Privacy Policy — Leaders Academia AI Assistant</title></head>
+<body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto; line-height: 1.6; color:#222;">
+  <h1>Privacy Policy — Leaders Academia AI Assistant</h1>
+  <p>This AI Assistant ("the Assistant") is operated by Leaders Academia to answer
+  questions about our courses, instructors, pricing, and platform via our website
+  chat widget and WhatsApp.</p>
+
+  <h3>What we collect</h3>
+  <p>When you message the Assistant (via our website or WhatsApp), we process the
+  text of your message and your WhatsApp phone number solely to generate a
+  relevant response and, where you request it, connect you with a human team
+  member.</p>
+
+  <h3>How we use it</h3>
+  <p>Message content is sent to our AI language model provider (Google Gemini) to
+  generate a reply. We do not sell or share your personal data with third
+  parties for advertising purposes.</p>
+
+  <h3>Data retention</h3>
+  <p>Conversation data is retained only as needed to operate and improve the
+  Assistant and is not used for any purpose beyond answering your questions and
+  providing support.</p>
+
+  <h3>Contact us</h3>
+  <p>For any privacy questions or data deletion requests, contact us at:<br>
+  Email: info@leadersacademia.com<br>
+  Phone: (051) 9876543<br>
+  WhatsApp: +92 311 1534344</p>
+
+  <p style="color:#777; font-size: 0.9em;">Last updated: 2026</p>
+</body>
+</html>
+"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_policy():
+    """Public privacy policy page — used as the 'Privacy Policy URL' when
+    publishing the Meta app."""
+    return PRIVACY_POLICY_HTML
 
 
 def send_whatsapp_message(to_number, message_text):
@@ -218,10 +263,8 @@ async def receive_whatsapp_message(request: Request):
                 reply = rag_answer(user_text)
                 send_whatsapp_message(sender_number, reply)
     except Exception as e:
-        # Meta also sends non-message events (delivery/read receipts) — ignore those quietly
         print("Webhook processing note:", e)
 
-    # Always return 200 quickly, or Meta will mark the webhook as failing
     return {"status": "ok"}
 
 
