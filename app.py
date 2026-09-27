@@ -25,7 +25,11 @@ import gradio as gr
 
 # ---------- Configuration ----------
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
-GEMINI_MODEL_NAME = "gemini-3.8-flash"
+
+# gemini-2.5-flash has a MUCH higher free-tier daily quota (~500-1500 req/day)
+# than the previous gemini-3.8-flash (only 20 req/day) — this is why replies
+# kept failing after a handful of messages.
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
 # Team head's contact number — given out when the bot can't answer something
 TEAM_HEAD_NUMBER = "0335-5229587"
