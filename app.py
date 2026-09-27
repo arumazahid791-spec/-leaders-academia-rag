@@ -22,6 +22,8 @@ from fastapi.responses import PlainTextResponse
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
 GEMINI_MODEL_NAME = "gemini-3.8-flash"
 
+TEAM_HEAD_NUMBER = "0335-5229587"
+
 HUMAN_HANDOFF_KEYWORDS = [
     "human", "real person", "agent", "representative",
     "insan se baat", "banda se baat", "customer support",
@@ -92,34 +94,45 @@ def rag_answer(user_question, max_retries=3):
     # Direct handoff — skip the model entirely for this case
     if wants_human(user_question):
         return (
-            "Zaroor! Aap hamari team se seedha rabta kar sakte hain:\n"
-            "Phone: (051) 9876543\n"
-            "WhatsApp Support: +92 311 1534344"
+            f"Zaroor! Aap hamari team head se seedha rabta kar sakte hain: "
+            f"{TEAM_HEAD_NUMBER}"
         )
 
     context_chunks = retrieve_chunks(user_question, top_k=4)
     context = "\n\n---\n\n".join(context_chunks)
 
-    prompt = f"""You are the official AI assistant for Leaders Academia.
+    prompt = f"""You are the official AI assistant for Leaders Academia, chatting with
+someone on WhatsApp. You're warm, natural, and easy to talk to — like a real
+person, not a scripted bot.
 
 LANGUAGE RULE: Always reply in the SAME language and script the user used in
 their message (English, Urdu script, or Roman Urdu). Never force one language
 if the user wrote in a different one.
 
-CONVERSATION RULE: For greetings and small talk (e.g. "how are you", "hi",
-"thanks") reply naturally and warmly like a human — never say information is
-unavailable for these.
+GENERAL CHAT RULE: You're not limited to only Leaders Academia topics. If the
+user makes small talk, asks a general question, or chats about something
+unrelated, engage naturally and pleasantly — like any friendly, knowledgeable
+person would. You don't need the CONTEXT for this.
 
-FACTUAL RULE: For questions about courses, instructors, pricing, schedules or
-the platform, answer ONLY using the CONTEXT below. If the answer is not in the
-CONTEXT, say clearly that this information is not available — never guess.
+LEADERS ACADEMIA RULE: For questions about courses, instructors, pricing,
+schedules or the platform, answer using the CONTEXT below as if it's simply
+what you know — speak naturally and confidently, the way a helpful human
+staff member would. Never mention "context", "the information provided",
+"based on the available data" or anything that reveals you're reading from a
+document.
+
+WHEN YOU DON'T KNOW: If a Leaders Academia question isn't answered by the
+CONTEXT, don't guess or invent details. Instead say naturally, in your own
+words, that you don't have that detail on hand and give them this number to
+reach the team head directly: {TEAM_HEAD_NUMBER}
 
 CONTEXT:
 {context}
 
 USER MESSAGE: {user_question}
 
-Reply clearly and concisely."""
+Reply clearly, briefly, and naturally — like a real person texting back, not
+a formal report."""
 
     for attempt in range(max_retries):
         try:
@@ -135,8 +148,8 @@ Reply clearly and concisely."""
                     continue
                 return (
                     "Maaf kijiye, is waqt AI system busy hai (free usage "
-                    "limit lag gayi hai). Thori dair mein dobara try karein, "
-                    "ya seedha rabta karein: +92 311 1534344 (WhatsApp)."
+                    f"limit lag gayi hai). Thori dair mein dobara try karein, "
+                    f"ya seedha rabta karein: {TEAM_HEAD_NUMBER}"
                 )
             return "Kuch masla aa gaya jawab generate karte waqt, dobara koshish karein."
 
@@ -175,6 +188,10 @@ def send_whatsapp_message(to_number, message_text):
 # ---------- FastAPI app: hosts the webhook AND the Gradio UI together ----------
 app = FastAPI()
 
+# Track WhatsApp message IDs we've already replied to, so Meta's automatic
+# retries (when our server is slow to respond) don't trigger duplicate replies.
+processed_message_ids = set()
+
 
 @app.get("/webhook")
 def verify_webhook(request: Request):
@@ -201,8 +218,15 @@ async def receive_whatsapp_message(request: Request):
 
         if messages:
             message = messages[0]
+            message_id = message.get("id")
             from_number = message["from"]  # sender's WhatsApp number
             print(f"Incoming WhatsApp message from: {from_number}")  # debug line
+
+            if message_id in processed_message_ids:
+                print(f"Duplicate delivery of message {message_id}, skipping.")
+                return {"status": "duplicate, skipped"}
+            processed_message_ids.add(message_id)
+
             user_text = message.get("text", {}).get("body", "")
 
             if user_text:
