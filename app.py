@@ -14,6 +14,7 @@ from sentence_transformers import SentenceTransformer
 import faiss
 from google import genai
 from google.genai import types
+from groq import Groq
 import gradio as gr
 import requests
 from fastapi import FastAPI, Request
@@ -21,7 +22,9 @@ from fastapi.responses import PlainTextResponse
 
 # ---------- Configuration ----------
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
-GEMINI_MODEL_NAME = "gemini-3.8-flash"
+GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
+GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 TEAM_HEAD_NUMBER = "0335-5229587"
 
@@ -38,6 +41,10 @@ if not GEMINI_API_KEY:
         "Variables tab in the Railway dashboard."
     )
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ---------- Groq: free backup, used only when Gemini is busy/rate-limited ----------
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ---------- WhatsApp Cloud API config (from Meta's "Try it out" page) ----------
 WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN")
@@ -91,7 +98,50 @@ def wants_human(text):
     return any(keyword in text for keyword in HUMAN_HANDOFF_KEYWORDS)
 
 
-def rag_answer(user_question, max_retries=3):
+def is_overloaded_error(e):
+    error_text = str(e)
+    return (
+        "429" in error_text
+        or "503" in error_text
+        or "quota" in error_text.lower()
+        or "UNAVAILABLE" in error_text
+    )
+
+
+def generate_text(prompt, max_retries=2):
+    """Try Gemini first; if it's busy or rate-limited, fall back to Groq —
+    same prompt goes to both, so the tone and style of the reply stays the
+    same no matter which one actually answers."""
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME, contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            if is_overloaded_error(e) and attempt < max_retries - 1:
+                time.sleep(8)
+                continue
+            print(f"Gemini failed, falling back to Groq: {e}")
+            break
+
+    if groq_client:
+        try:
+            completion = groq_client.chat.completions.create(
+                model=GROQ_CHAT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            print(f"Groq also failed: {e}")
+
+    return (
+        "Maaf kijiye, is waqt AI system busy hai. Thori dair mein dobara "
+        f"try karein, ya seedha rabta karein: {TEAM_HEAD_NUMBER}"
+    )
+
+
+def rag_answer(user_question):
     # Direct handoff — skip the model entirely for this case
     if wants_human(user_question):
         return (
@@ -135,24 +185,7 @@ USER MESSAGE: {user_question}
 Reply clearly, briefly, and naturally — like a real person texting back, not
 a formal report."""
 
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL_NAME, contents=prompt
-            )
-            return response.text
-        except Exception as e:
-            error_text = str(e)
-            if "429" in error_text or "503" in error_text or "quota" in error_text.lower() or "UNAVAILABLE" in error_text:
-                if attempt < max_retries - 1:
-                    time.sleep(15)  # back off and retry once on rate limit / busy server
-                    continue
-                return (
-                    "Maaf kijiye, is waqt AI system busy hai (free usage "
-                    f"limit lag gayi hai). Thori dair mein dobara try karein, "
-                    f"ya seedha rabta karein: {TEAM_HEAD_NUMBER}"
-                )
-            return "Kuch masla aa gaya jawab generate karte waqt, dobara koshish karein."
+    return generate_text(prompt)
 
 
 # ---------- Gradio frontend ----------
@@ -201,9 +234,10 @@ def download_whatsapp_media(media_id):
     return media_response.content, mime_type
 
 
-def transcribe_audio(audio_bytes, mime_type, max_retries=3):
-    """Send the voice note straight to Gemini and get back the spoken text."""
-    for attempt in range(max_retries):
+def transcribe_audio(audio_bytes, mime_type):
+    """Send the voice note to Gemini first; if it's busy, fall back to
+    Groq's free Whisper transcription."""
+    for attempt in range(2):
         try:
             response = client.models.generate_content(
                 model=GEMINI_MODEL_NAME,
@@ -215,13 +249,21 @@ def transcribe_audio(audio_bytes, mime_type, max_retries=3):
             )
             return response.text.strip()
         except Exception as e:
-            error_text = str(e)
-            if "503" in error_text or "UNAVAILABLE" in error_text or "429" in error_text:
-                if attempt < max_retries - 1:
-                    print(f"Gemini busy during transcription, retrying... ({e})")
-                    time.sleep(10)
-                    continue
-            raise
+            if is_overloaded_error(e) and attempt == 0:
+                time.sleep(8)
+                continue
+            print(f"Gemini transcription failed, falling back to Groq: {e}")
+            break
+
+    if groq_client:
+        extension = "ogg" if "ogg" in mime_type else "mp3"
+        transcription = groq_client.audio.transcriptions.create(
+            file=(f"voice.{extension}", audio_bytes),
+            model=GROQ_WHISPER_MODEL,
+        )
+        return transcription.text.strip()
+
+    raise RuntimeError("Both Gemini and Groq failed to transcribe the audio.")
 
 
 def text_to_speech(text):
