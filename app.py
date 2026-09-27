@@ -143,9 +143,9 @@ a formal report."""
             return response.text
         except Exception as e:
             error_text = str(e)
-            if "429" in error_text or "quota" in error_text.lower():
+            if "429" in error_text or "503" in error_text or "quota" in error_text.lower() or "UNAVAILABLE" in error_text:
                 if attempt < max_retries - 1:
-                    time.sleep(15)  # back off and retry once on rate limit
+                    time.sleep(15)  # back off and retry once on rate limit / busy server
                     continue
                 return (
                     "Maaf kijiye, is waqt AI system busy hai (free usage "
@@ -201,17 +201,27 @@ def download_whatsapp_media(media_id):
     return media_response.content, mime_type
 
 
-def transcribe_audio(audio_bytes, mime_type):
+def transcribe_audio(audio_bytes, mime_type, max_retries=3):
     """Send the voice note straight to Gemini and get back the spoken text."""
-    response = client.models.generate_content(
-        model=GEMINI_MODEL_NAME,
-        contents=[
-            "Transcribe exactly what is said in this audio clip. Reply with "
-            "only the transcription, nothing else.",
-            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-        ],
-    )
-    return response.text.strip()
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=[
+                    "Transcribe exactly what is said in this audio clip. Reply "
+                    "with only the transcription, nothing else.",
+                    types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                ],
+            )
+            return response.text.strip()
+        except Exception as e:
+            error_text = str(e)
+            if "503" in error_text or "UNAVAILABLE" in error_text or "429" in error_text:
+                if attempt < max_retries - 1:
+                    print(f"Gemini busy during transcription, retrying... ({e})")
+                    time.sleep(10)
+                    continue
+            raise
 
 
 def text_to_speech(text):
@@ -309,9 +319,19 @@ async def receive_whatsapp_message(request: Request):
             elif msg_type == "audio":
                 is_voice_message = True
                 media_id = message["audio"]["id"]
-                audio_bytes, mime_type = download_whatsapp_media(media_id)
-                user_text = transcribe_audio(audio_bytes, mime_type)
-                print(f"Transcribed voice message: {user_text}")
+                try:
+                    audio_bytes, mime_type = download_whatsapp_media(media_id)
+                    user_text = transcribe_audio(audio_bytes, mime_type)
+                    print(f"Transcribed voice message: {user_text}")
+                except Exception as e:
+                    print(f"Voice transcription failed after retries: {e}")
+                    send_whatsapp_message(
+                        from_number,
+                        "Maaf kijiye, is waqt AI system busy hai. Thori dair "
+                        "mein dobara voice note bhej kar try karein, ya text "
+                        f"mein likh dein, ya seedha rabta karein: {TEAM_HEAD_NUMBER}",
+                    )
+                    user_text = None
 
             if user_text:
                 reply_text = rag_answer(user_text)
