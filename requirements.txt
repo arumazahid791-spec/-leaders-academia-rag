@@ -2,6 +2,7 @@ pypdf
 sentence-transformers
 faiss-cpu
 google-genai
+groq
 gradio
 numpy
 fastapi
