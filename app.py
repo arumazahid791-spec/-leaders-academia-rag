@@ -26,10 +26,11 @@ import gradio as gr
 # ---------- Configuration ----------
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
 
-# gemini-2.5-flash has a MUCH higher free-tier daily quota (~500-1500 req/day)
-# than the previous gemini-3.8-flash (only 20 req/day) — this is why replies
-# kept failing after a handful of messages.
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
+# NOTE: gemini-2.5-flash is not available to new accounts (Google's own API
+# confirmed this). gemini-3.8-flash is the required model, but its free tier
+# is only ~20 requests/day — expect "busy" replies after ~20 messages/day
+# until billing is enabled on the Google AI Studio project for higher quota.
+GEMINI_MODEL_NAME = "gemini-3.8-flash"
 
 # Team head's contact number — given out when the bot can't answer something
 TEAM_HEAD_NUMBER = "0335-5229587"
@@ -48,9 +49,11 @@ if not GEMINI_API_KEY:
     )
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# WhatsApp Cloud API credentials — add these three in Railway -> Variables
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")              # "Access token" from Meta
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")            # "Phone Number ID" from Meta
+# WhatsApp Cloud API credentials — these match the variable names already set
+# in Railway (Variables tab): WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID,
+# WHATSAPP_VERIFY_TOKEN
+WHATSAPP_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN")       # "Access token" from Meta
+PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")   # "Phone Number ID" from Meta
 WHATSAPP_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "leadersacademia2026")
 
 
@@ -228,7 +231,7 @@ def privacy_policy():
 def send_whatsapp_message(to_number, message_text):
     """Sends a plain-text reply back to a WhatsApp user via Meta's Cloud API."""
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        print("WhatsApp not configured (missing WHATSAPP_TOKEN / PHONE_NUMBER_ID) — skipping send.")
+        print("WhatsApp not configured (missing WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID) — skipping send.")
         return
 
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
