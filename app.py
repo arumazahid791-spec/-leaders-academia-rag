@@ -1,38 +1,28 @@
 """
-Leaders Academia — RAG Chatbot + WhatsApp Webhook
+Leaders Academia — RAG Chatbot
 Runs on Railway (or any host with a Procfile-style start command).
 
 Pipeline: PDF -> text chunks -> free local embeddings -> FAISS index ->
-Gemini (context-grounded answer) -> served three ways from ONE app:
-  1) Gradio chat UI (browser testing)        -> GET  /
-  2) WhatsApp Cloud API webhook (real chats) -> GET/POST /webhook
-  3) Privacy Policy page (for Meta App Publish requirement) -> GET /privacy
+Gemini (context-grounded answer) -> Gradio chat UI.
 """
 
 import os
 import time
 
-import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, HTMLResponse
-import uvicorn
-
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import faiss
 from google import genai
+from google.genai import types
 import gradio as gr
+import requests
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
 
 # ---------- Configuration ----------
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
-
-# NOTE: gemini-2.5-flash is not available to new accounts (Google's own API
-# confirmed this). gemini-3.8-flash is the required model, but its free tier
-# is only ~20 requests/day — expect "busy" replies after ~20 messages/day
-# until billing is enabled on the Google AI Studio project for higher quota.
 GEMINI_MODEL_NAME = "gemini-3.8-flash"
 
-# Team head's contact number — given out when the bot can't answer something
 TEAM_HEAD_NUMBER = "0335-5229587"
 
 HUMAN_HANDOFF_KEYWORDS = [
@@ -40,7 +30,7 @@ HUMAN_HANDOFF_KEYWORDS = [
     "insan se baat", "banda se baat", "customer support",
 ]
 
-# ---------- Load secrets from Railway's environment variables (never hardcode them) ----------
+# ---------- Load API key from Railway's environment variables (never hardcode it) ----------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError(
@@ -49,15 +39,15 @@ if not GEMINI_API_KEY:
     )
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# WhatsApp Cloud API credentials — these match the variable names already set
-# in Railway (Variables tab): WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID,
-# WHATSAPP_VERIFY_TOKEN
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN")       # "Access token" from Meta
-PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")   # "Phone Number ID" from Meta
-WHATSAPP_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "leadersacademia2026")
+# ---------- WhatsApp Cloud API config (from Meta's "Try it out" page) ----------
+WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN")
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+# A password you make up yourself — must match exactly what you type into
+# Meta's webhook "Verify token" field. Not secret from Meta, just needs to match.
+WHATSAPP_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "leaders_academia_verify")
 
 
-# ---------- Build the knowledge base once, when the app starts ----------
+# ---------- Build the knowledge base once, when the Space starts ----------
 def load_pdf_text(path):
     reader = PdfReader(path)
     text = ""
@@ -105,41 +95,45 @@ def rag_answer(user_question, max_retries=3):
     # Direct handoff — skip the model entirely for this case
     if wants_human(user_question):
         return (
-            "Zaroor! Aap hamari team head se seedha rabta kar sakte hain:\n"
+            f"Zaroor! Aap hamari team head se seedha rabta kar sakte hain: "
             f"{TEAM_HEAD_NUMBER}"
         )
 
     context_chunks = retrieve_chunks(user_question, top_k=4)
     context = "\n\n---\n\n".join(context_chunks)
 
-    prompt = f"""You are the official AI assistant for Leaders Academia. You are also a
-warm, helpful, general-purpose conversational assistant — not limited to only
-Leaders Academia topics.
+    prompt = f"""You are the official AI assistant for Leaders Academia, chatting with
+someone on WhatsApp. You're warm, natural, and easy to talk to — like a real
+person, not a scripted bot.
 
 LANGUAGE RULE: Always reply in the SAME language and script the user used in
 their message (English, Urdu script, or Roman Urdu). Never force one language
 if the user wrote in a different one.
 
-CONVERSATION RULE: For greetings, small talk, casual questions, or anything
-NOT specifically about Leaders Academia (general knowledge, advice, everyday
-chit-chat, etc.), reply naturally, warmly, and helpfully like a normal
-friendly AI assistant would — do not refuse or restrict yourself to only
-Leaders Academia subjects.
+GENERAL CHAT RULE: You're not limited to only Leaders Academia topics. If the
+user makes small talk, asks a general question, or chats about something
+unrelated, engage naturally and pleasantly — like any friendly, knowledgeable
+person would. You don't need the CONTEXT for this.
 
-FACTUAL RULE (Leaders Academia specific topics only): For questions about
-Leaders Academia's courses, instructors, pricing, schedules, admissions, or
-the platform itself, answer ONLY using the CONTEXT below. If the specific
-answer is not in the CONTEXT, say politely that you don't have that exact
-detail right now, and offer to connect them with the team head for help:
-"Iske liye behtar hoga aap hamari team head se rabta karein: {TEAM_HEAD_NUMBER}"
-Never guess or invent Leaders Academia facts that aren't in the CONTEXT.
+LEADERS ACADEMIA RULE: For questions about courses, instructors, pricing,
+schedules or the platform, answer using the CONTEXT below as if it's simply
+what you know — speak naturally and confidently, the way a helpful human
+staff member would. Never mention "context", "the information provided",
+"based on the available data" or anything that reveals you're reading from a
+document.
+
+WHEN YOU DON'T KNOW: If a Leaders Academia question isn't answered by the
+CONTEXT, don't guess or invent details. Instead say naturally, in your own
+words, that you don't have that detail on hand and give them this number to
+reach the team head directly: {TEAM_HEAD_NUMBER}
 
 CONTEXT:
 {context}
 
 USER MESSAGE: {user_question}
 
-Reply clearly and concisely."""
+Reply clearly, briefly, and naturally — like a real person texting back, not
+a formal report."""
 
     for attempt in range(max_retries):
         try:
@@ -149,23 +143,19 @@ Reply clearly and concisely."""
             return response.text
         except Exception as e:
             error_text = str(e)
-            print(f"Gemini error (attempt {attempt + 1}/{max_retries}): {error_text}")
             if "429" in error_text or "quota" in error_text.lower():
                 if attempt < max_retries - 1:
                     time.sleep(15)  # back off and retry once on rate limit
                     continue
                 return (
                     "Maaf kijiye, is waqt AI system busy hai (free usage "
-                    "limit lag gayi hai). Thori dair mein dobara try karein, "
+                    f"limit lag gayi hai). Thori dair mein dobara try karein, "
                     f"ya seedha rabta karein: {TEAM_HEAD_NUMBER}"
                 )
-            return (
-                "Kuch masla aa gaya jawab generate karte waqt, dobara koshish karein. "
-                f"Ya seedha rabta karein: {TEAM_HEAD_NUMBER}"
-            )
+            return "Kuch masla aa gaya jawab generate karte waqt, dobara koshish karein."
 
 
-# ---------- Gradio frontend (browser demo) ----------
+# ---------- Gradio frontend ----------
 def chat_fn(message, history):
     return rag_answer(message)
 
@@ -173,70 +163,15 @@ def chat_fn(message, history):
 demo = gr.ChatInterface(
     fn=chat_fn,
     title="Leaders Academia — AI Assistant",
-    description="Courses, instructors aur platform ke baare mein kuch bhi puchein — ya bas baat karein!",
+    description="Courses, instructors aur platform ke baare mein kuch bhi puchein.",
 )
 
-
-# ======================================================================
-# FastAPI app — hosts the WhatsApp webhook, privacy policy, and mounts Gradio
-# ======================================================================
-app = FastAPI()
-
-
-PRIVACY_POLICY_HTML = """
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Privacy Policy — Leaders Academia AI Assistant</title></head>
-<body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto; line-height: 1.6; color:#222;">
-  <h1>Privacy Policy — Leaders Academia AI Assistant</h1>
-  <p>This AI Assistant ("the Assistant") is operated by Leaders Academia to answer
-  questions about our courses, instructors, pricing, and platform via our website
-  chat widget and WhatsApp.</p>
-
-  <h3>What we collect</h3>
-  <p>When you message the Assistant (via our website or WhatsApp), we process the
-  text of your message and your WhatsApp phone number solely to generate a
-  relevant response and, where you request it, connect you with a human team
-  member.</p>
-
-  <h3>How we use it</h3>
-  <p>Message content is sent to our AI language model provider (Google Gemini) to
-  generate a reply. We do not sell or share your personal data with third
-  parties for advertising purposes.</p>
-
-  <h3>Data retention</h3>
-  <p>Conversation data is retained only as needed to operate and improve the
-  Assistant and is not used for any purpose beyond answering your questions and
-  providing support.</p>
-
-  <h3>Contact us</h3>
-  <p>For any privacy questions or data deletion requests, contact us at:<br>
-  Email: info@leadersacademia.com<br>
-  Phone: (051) 9876543<br>
-  WhatsApp: +92 311 1534344</p>
-
-  <p style="color:#777; font-size: 0.9em;">Last updated: 2026</p>
-</body>
-</html>
-"""
-
-
-@app.get("/privacy", response_class=HTMLResponse)
-def privacy_policy():
-    """Public privacy policy page — used as the 'Privacy Policy URL' when
-    publishing the Meta app."""
-    return PRIVACY_POLICY_HTML
-
-
+# ---------- WhatsApp send helper ----------
 def send_whatsapp_message(to_number, message_text):
-    """Sends a plain-text reply back to a WhatsApp user via Meta's Cloud API."""
-    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        print("WhatsApp not configured (missing WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID) — skipping send.")
-        return
-
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+    """Send a plain text reply back to a WhatsApp user via the Cloud API."""
+    url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -245,55 +180,161 @@ def send_whatsapp_message(to_number, message_text):
         "type": "text",
         "text": {"body": message_text},
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=20)
-        if resp.status_code >= 400:
-            print("WhatsApp send failed:", resp.status_code, resp.text)
-    except Exception as e:
-        print("WhatsApp send error:", e)
+    response = requests.post(url, headers=headers, json=payload, timeout=20)
+    if response.status_code != 200:
+        print("WhatsApp send failed:", response.status_code, response.text)
+    return response
+
+
+# ---------- Voice message support ----------
+def download_whatsapp_media(media_id):
+    """WhatsApp gives us a media ID, not a direct file — this fetches the
+    real download URL first, then downloads the actual audio bytes."""
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+
+    info_url = f"https://graph.facebook.com/v25.0/{media_id}"
+    info = requests.get(info_url, headers=headers, timeout=20).json()
+    media_url = info["url"]
+    mime_type = info.get("mime_type", "audio/ogg")
+
+    media_response = requests.get(media_url, headers=headers, timeout=30)
+    return media_response.content, mime_type
+
+
+def transcribe_audio(audio_bytes, mime_type):
+    """Send the voice note straight to Gemini and get back the spoken text."""
+    response = client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=[
+            "Transcribe exactly what is said in this audio clip. Reply with "
+            "only the transcription, nothing else.",
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
+    )
+    return response.text.strip()
+
+
+def text_to_speech(text):
+    """Convert a text reply into an MP3 voice note using free gTTS."""
+    from gtts import gTTS
+    import io
+
+    tts = gTTS(text=text, lang="ur")  # Urdu voice; works fine for Roman Urdu/English too
+    buffer = io.BytesIO()
+    tts.write_to_fp(buffer)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def send_whatsapp_voice(to_number, audio_bytes):
+    """Upload an MP3 to WhatsApp's media store, then send it as a voice note."""
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+
+    upload_url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_NUMBER_ID}/media"
+    files = {"file": ("reply.mp3", audio_bytes, "audio/mpeg")}
+    data = {"messaging_product": "whatsapp", "type": "audio/mpeg"}
+    upload_response = requests.post(
+        upload_url, headers=headers, files=files, data=data, timeout=30
+    ).json()
+    media_id = upload_response.get("id")
+    if not media_id:
+        print("Voice upload failed:", upload_response)
+        return
+
+    send_url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "audio",
+        "audio": {"id": media_id},
+    }
+    response = requests.post(
+        send_url,
+        headers={**headers, "Content-Type": "application/json"},
+        json=payload,
+        timeout=20,
+    )
+    if response.status_code != 200:
+        print("WhatsApp voice send failed:", response.status_code, response.text)
+
+
+# ---------- FastAPI app: hosts the webhook AND the Gradio UI together ----------
+app = FastAPI()
+
+# Track WhatsApp message IDs we've already replied to, so Meta's automatic
+# retries (when our server is slow to respond) don't trigger duplicate replies.
+processed_message_ids = set()
 
 
 @app.get("/webhook")
 def verify_webhook(request: Request):
-    """Meta calls this ONCE, when you click 'Verify and save' in the dashboard."""
+    """Meta calls this once, when you save the webhook URL, to confirm you
+    own this server. It must echo back the 'hub.challenge' value."""
     params = request.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
 
     if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-        return PlainTextResponse(content=challenge, status_code=200)
-    return PlainTextResponse(content="Verification failed", status_code=403)
+        return PlainTextResponse(challenge)
+    return PlainTextResponse("Verification failed", status_code=403)
 
 
 @app.post("/webhook")
 async def receive_whatsapp_message(request: Request):
-    """Meta calls this every time a WhatsApp user sends your number a message."""
-    body = await request.json()
+    """Meta calls this every time a user sends a WhatsApp message."""
+    data = await request.json()
     try:
-        entry = body["entry"][0]
-        changes = entry["changes"][0]
-        value = changes["value"]
-        messages = value.get("messages")
+        entry = data["entry"][0]
+        change = entry["changes"][0]["value"]
+        messages = change.get("messages")
 
         if messages:
             message = messages[0]
-            sender_number = message["from"]
-            user_text = message.get("text", {}).get("body", "")
+            message_id = message.get("id")
+            from_number = message["from"]  # sender's WhatsApp number
+            msg_type = message.get("type")
+            print(f"Incoming WhatsApp {msg_type} message from: {from_number}")
+
+            if message_id in processed_message_ids:
+                print(f"Duplicate delivery of message {message_id}, skipping.")
+                return {"status": "duplicate, skipped"}
+            processed_message_ids.add(message_id)
+
+            user_text = None
+            is_voice_message = False
+
+            if msg_type == "text":
+                user_text = message.get("text", {}).get("body", "")
+            elif msg_type == "audio":
+                is_voice_message = True
+                media_id = message["audio"]["id"]
+                audio_bytes, mime_type = download_whatsapp_media(media_id)
+                user_text = transcribe_audio(audio_bytes, mime_type)
+                print(f"Transcribed voice message: {user_text}")
 
             if user_text:
-                reply = rag_answer(user_text)
-                send_whatsapp_message(sender_number, reply)
+                reply_text = rag_answer(user_text)
+
+                if is_voice_message:
+                    # Voice in, voice out — feels like a real conversation
+                    reply_audio = text_to_speech(reply_text)
+                    send_whatsapp_voice(from_number, reply_audio)
+                else:
+                    send_whatsapp_message(from_number, reply_text)
     except Exception as e:
-        print("Webhook processing note:", e)
+        print("Error processing incoming WhatsApp message:", e)
 
-    return {"status": "ok"}
+    # Always return 200 quickly so Meta doesn't retry/resend the same message
+    return {"status": "received"}
 
 
-# Mount the Gradio chat UI at the root path ("/") so the browser demo still works
+# Mount the Gradio chat UI at "/" for browser-based testing, alongside the
+# WhatsApp webhook routes above.
 app = gr.mount_gradio_app(app, demo, path="/")
 
-
 if __name__ == "__main__":
+    import uvicorn
+
     port = int(os.environ.get("PORT", 7860))
     uvicorn.run(app, host="0.0.0.0", port=port)
