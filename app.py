@@ -202,6 +202,7 @@ async def receive_whatsapp_message(request: Request):
         if messages:
             message = messages[0]
             from_number = message["from"]  # sender's WhatsApp number
+            print(f"Incoming WhatsApp message from: {from_number}")  # debug line
             user_text = message.get("text", {}).get("body", "")
 
             if user_text:
