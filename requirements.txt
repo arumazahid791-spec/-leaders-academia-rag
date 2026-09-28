@@ -8,4 +8,4 @@ numpy
 fastapi
 uvicorn
 requests
-gtts
+edge-tts
