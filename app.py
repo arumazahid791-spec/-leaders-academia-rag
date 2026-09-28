@@ -6,6 +6,7 @@ Pipeline: PDF -> text chunks -> free local embeddings -> FAISS index ->
 Gemini (context-grounded answer) -> Gradio chat UI.
 """
 
+import asyncio
 import os
 import time
 
@@ -294,13 +295,63 @@ def clean_text_for_speech(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-async def text_to_speech(text):
-    """Convert a text reply into an MP3 voice note using free, natural-sounding
-    Microsoft Edge neural voices (no API key needed). The voice is picked by the
-    script of the reply: Urdu script -> Urdu voice, otherwise English voice."""
+# Which voice engine to use. "gemini" = newer, more natural Gemini TTS (falls back
+# to edge-tts automatically if it fails). "edge" = always use edge-tts.
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "gemini").lower()
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Sulafat")
+GEMINI_TTS_STYLE = "warm, friendly and natural, like a helpful person on a phone call"
+
+
+def gemini_text_to_speech(text):
+    """Ask Gemini TTS for speech. Returns raw 24 kHz mono 16-bit PCM bytes."""
+    import base64
+
+    interaction = client.interactions.create(
+        model=GEMINI_TTS_MODEL,
+        input=[{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
+                "text": text,
+                "annotations": [{
+                    "type": "speech_metadata",
+                    "style": GEMINI_TTS_STYLE,
+                }],
+            }],
+        }],
+        response_format={"type": "audio", "mime_type": "audio/l16", "sample_rate": 24000},
+        generation_config={"speech_config": [{"voice": GEMINI_TTS_VOICE}]},
+    )
+    return base64.b64decode(interaction.output_audio.data)
+
+
+def encode_pcm_for_whatsapp(pcm_bytes, sample_rate=24000):
+    """WhatsApp doesn't accept WAV/PCM, so convert to Ogg/Opus (shows up as a
+    proper voice note) or MP3 as a backup. Returns (bytes, mime_type, filename)."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+    try:
+        buffer = io.BytesIO()
+        sf.write(buffer, samples, sample_rate, format="OGG", subtype="OPUS")
+        return buffer.getvalue(), "audio/ogg", "reply.ogg"
+    except Exception as e:
+        print(f"Ogg/Opus encoding failed, trying MP3: {e}")
+
+    buffer = io.BytesIO()
+    sf.write(buffer, samples, sample_rate, format="MP3")
+    return buffer.getvalue(), "audio/mpeg", "reply.mp3"
+
+
+async def edge_text_to_speech(text):
+    """Backup voice: free Microsoft Edge neural voices (no API key needed).
+    Voice is picked by script: Urdu script -> Urdu voice, otherwise English."""
     import edge_tts
 
-    text = clean_text_for_speech(text)
     has_urdu_script = any("\u0600" <= ch <= "\u06ff" for ch in text)
     voice = URDU_VOICE if has_urdu_script else ENGLISH_VOICE
 
@@ -312,20 +363,40 @@ async def text_to_speech(text):
     return audio_bytes
 
 
-def send_whatsapp_voice(to_number, audio_bytes):
-    """Upload an MP3 to WhatsApp's media store, then send it as a voice note."""
+async def synthesize_reply_audio(text):
+    """Turn a text reply into a WhatsApp-ready voice note.
+    Returns (audio_bytes, mime_type, filename)."""
+    text = clean_text_for_speech(text)
+
+    if TTS_ENGINE == "gemini":
+        try:
+            pcm = await asyncio.to_thread(gemini_text_to_speech, text)
+            audio = await asyncio.to_thread(encode_pcm_for_whatsapp, pcm)
+            print("Voice reply generated with Gemini TTS")
+            return audio
+        except Exception as e:
+            print(f"Gemini TTS failed, falling back to edge-tts: {e}")
+
+    audio_bytes = await edge_text_to_speech(text)
+    print("Voice reply generated with edge-tts")
+    return audio_bytes, "audio/mpeg", "reply.mp3"
+
+
+def send_whatsapp_voice(to_number, audio_bytes, mime_type="audio/mpeg", filename="reply.mp3"):
+    """Upload audio to WhatsApp's media store, then send it as a voice note.
+    Returns True if it was sent, False otherwise."""
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
 
     upload_url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_NUMBER_ID}/media"
-    files = {"file": ("reply.mp3", audio_bytes, "audio/mpeg")}
-    data = {"messaging_product": "whatsapp", "type": "audio/mpeg"}
+    files = {"file": (filename, audio_bytes, mime_type)}
+    data = {"messaging_product": "whatsapp", "type": mime_type}
     upload_response = requests.post(
         upload_url, headers=headers, files=files, data=data, timeout=30
     ).json()
     media_id = upload_response.get("id")
     if not media_id:
         print("Voice upload failed:", upload_response)
-        return
+        return False
 
     send_url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     payload = {
@@ -342,6 +413,8 @@ def send_whatsapp_voice(to_number, audio_bytes):
     )
     if response.status_code != 200:
         print("WhatsApp voice send failed:", response.status_code, response.text)
+        return False
+    return True
 
 
 # ---------- FastAPI app: hosts the webhook AND the Gradio UI together ----------
@@ -414,12 +487,14 @@ async def receive_whatsapp_message(request: Request):
 
                 if is_voice_message:
                     # Voice in, voice out — feels like a real conversation
+                    voice_sent = False
                     try:
-                        reply_audio = await text_to_speech(reply_text)
-                        send_whatsapp_voice(from_number, reply_audio)
+                        audio, mime_type, filename = await synthesize_reply_audio(reply_text)
+                        voice_sent = send_whatsapp_voice(from_number, audio, mime_type, filename)
                     except Exception as e:
-                        # If speech generation fails, still answer in text
-                        print(f"Text-to-speech failed, sending text instead: {e}")
+                        print(f"Voice reply failed: {e}")
+                    if not voice_sent:
+                        # Never leave the user without an answer
                         send_whatsapp_message(from_number, reply_text)
                 else:
                     send_whatsapp_message(from_number, reply_text)
