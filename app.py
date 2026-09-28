@@ -141,7 +141,7 @@ def generate_text(prompt, max_retries=2):
     )
 
 
-def rag_answer(user_question):
+def rag_answer(user_question, voice=False):
     # Direct handoff — skip the model entirely for this case
     if wants_human(user_question):
         return (
@@ -152,18 +152,31 @@ def rag_answer(user_question):
     context_chunks = retrieve_chunks(user_question, top_k=4)
     context = "\n\n---\n\n".join(context_chunks)
 
+    voice_rule = ""
+    if voice:
+        voice_rule = """
+VOICE RULE: This reply will be spoken aloud as a voice note. Keep it short
+(2-3 sentences), warm and conversational. No lists, no bullet points, no
+emojis, no symbols. If the user spoke Urdu or Hindi, reply in Urdu script
+(اردو). If the user spoke English, reply in English.
+"""
+
     prompt = f"""You are the official AI assistant for Leaders Academia, chatting with
 someone on WhatsApp. You're warm, natural, and easy to talk to — like a real
-person, not a scripted bot.
+person on the team, not a scripted bot.
 
 LANGUAGE RULE: Always reply in the SAME language and script the user used in
 their message (English, Urdu script, or Roman Urdu). Never force one language
 if the user wrote in a different one.
 
-GENERAL CHAT RULE: You're not limited to only Leaders Academia topics. If the
-user makes small talk, asks a general question, or chats about something
-unrelated, engage naturally and pleasantly — like any friendly, knowledgeable
-person would. You don't need the CONTEXT for this.
+SCOPE RULE: You only help with Leaders Academia — its courses, instructors,
+fees, schedules and platform. Friendly small talk is welcome (greetings,
+"how are you", thanks, goodbye) — answer those warmly and briefly, then
+gently steer back to how you can help with Leaders Academia. If someone asks
+for something unrelated to Leaders Academia (recipes, coding help, general
+knowledge, news, homework, etc.), politely say you can only help with
+Leaders Academia and invite them to ask about the courses or services. Do NOT
+provide the unrelated information, not even briefly.
 
 LEADERS ACADEMIA RULE: For questions about courses, instructors, pricing,
 schedules or the platform, answer using the CONTEXT below as if it's simply
@@ -176,7 +189,7 @@ WHEN YOU DON'T KNOW: If a Leaders Academia question isn't answered by the
 CONTEXT, don't guess or invent details. Instead say naturally, in your own
 words, that you don't have that detail on hand and give them this number to
 reach the team head directly: {TEAM_HEAD_NUMBER}
-
+{voice_rule}
 CONTEXT:
 {context}
 
@@ -242,8 +255,10 @@ def transcribe_audio(audio_bytes, mime_type):
             response = client.models.generate_content(
                 model=GEMINI_MODEL_NAME,
                 contents=[
-                    "Transcribe exactly what is said in this audio clip. Reply "
-                    "with only the transcription, nothing else.",
+                    "Transcribe exactly what is said in this audio clip. If the "
+                    "speech is Urdu or Hindi, write it in Urdu script (اردو), not "
+                    "Devanagari. If it is English, write it in English. Reply with "
+                    "only the transcription, nothing else.",
                     types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
                 ],
             )
@@ -266,16 +281,35 @@ def transcribe_audio(audio_bytes, mime_type):
     raise RuntimeError("Both Gemini and Groq failed to transcribe the audio.")
 
 
-def text_to_speech(text):
-    """Convert a text reply into an MP3 voice note using free gTTS."""
-    from gtts import gTTS
-    import io
+URDU_VOICE = "ur-PK-UzmaNeural"
+ENGLISH_VOICE = "en-IN-NeerjaNeural"
 
-    tts = gTTS(text=text, lang="ur")  # Urdu voice; works fine for Roman Urdu/English too
-    buffer = io.BytesIO()
-    tts.write_to_fp(buffer)
-    buffer.seek(0)
-    return buffer.read()
+
+def clean_text_for_speech(text):
+    """Strip markdown symbols and emojis so the voice doesn't read them out."""
+    import re
+
+    text = re.sub(r"[*_#`>~|]", "", text)
+    text = re.sub(r"[\U00010000-\U0010ffff\u2600-\u27bf]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+async def text_to_speech(text):
+    """Convert a text reply into an MP3 voice note using free, natural-sounding
+    Microsoft Edge neural voices (no API key needed). The voice is picked by the
+    script of the reply: Urdu script -> Urdu voice, otherwise English voice."""
+    import edge_tts
+
+    text = clean_text_for_speech(text)
+    has_urdu_script = any("\u0600" <= ch <= "\u06ff" for ch in text)
+    voice = URDU_VOICE if has_urdu_script else ENGLISH_VOICE
+
+    communicate = edge_tts.Communicate(text, voice=voice, rate="+5%")
+    audio_bytes = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_bytes += chunk["data"]
+    return audio_bytes
 
 
 def send_whatsapp_voice(to_number, audio_bytes):
@@ -376,12 +410,17 @@ async def receive_whatsapp_message(request: Request):
                     user_text = None
 
             if user_text:
-                reply_text = rag_answer(user_text)
+                reply_text = rag_answer(user_text, voice=is_voice_message)
 
                 if is_voice_message:
                     # Voice in, voice out — feels like a real conversation
-                    reply_audio = text_to_speech(reply_text)
-                    send_whatsapp_voice(from_number, reply_audio)
+                    try:
+                        reply_audio = await text_to_speech(reply_text)
+                        send_whatsapp_voice(from_number, reply_audio)
+                    except Exception as e:
+                        # If speech generation fails, still answer in text
+                        print(f"Text-to-speech failed, sending text instead: {e}")
+                        send_whatsapp_message(from_number, reply_text)
                 else:
                     send_whatsapp_message(from_number, reply_text)
     except Exception as e:
