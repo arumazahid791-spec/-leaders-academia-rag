@@ -5,6 +5,7 @@ google-genai
 groq
 gradio
 numpy
+soundfile
 fastapi
 uvicorn
 requests
