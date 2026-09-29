@@ -24,19 +24,17 @@ from fastapi.responses import PlainTextResponse
 # ---------- Configuration ----------
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-GROQ_CHAT_MODEL = "llama-3.1-8b-instant"
+GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 TEAM_HEAD_NUMBER = "0311-1534344"
 
-# Courses to always mention first, in this exact priority order, whenever the
-# bot talks about or lists courses — matches the priority order on the
-# website. These are injected directly into every prompt (not relying on PDF
-# retrieval), so they never get left out even if the retrieved chunks miss them.
+# Courses to always mention first, in this order, when giving any kind of
+# course list or recommendation — matches the website's own priority order.
 PRIORITY_COURSES = [
-    "AI & Automation",
+    "AI Automation",
     "Web Development",
-    "Ecommerce",
+    "E-commerce",
     "Digital Marketing",
 ]
 
@@ -52,11 +50,10 @@ if not GEMINI_API_KEY:
         "GEMINI_API_KEY not found. Add it under this project's "
         "Variables tab in the Railway dashboard."
     )
-# 12 s hard timeout (Gemini requires a minimum of 10s) — if it hasn't answered
-# by then, fail fast and let Groq (much faster) answer instead.
+# 20 s hard timeout so a slow/hung Gemini call can never stall a reply for a minute
 client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=12000),  # milliseconds
+    http_options=types.HttpOptions(timeout=20000),  # milliseconds
 )
 
 # ---------- Groq: free backup, used only when Gemini is busy/rate-limited ----------
@@ -106,7 +103,7 @@ print(f"Knowledge base ready: {len(chunks)} chunks indexed.")
 
 
 # ---------- RAG logic ----------
-def retrieve_chunks(query, top_k=8):
+def retrieve_chunks(query, top_k=6):
     query_vec = embed_model.encode([query], convert_to_numpy=True)
     _, indices = index.search(query_vec, top_k)
     return [chunks[i] for i in indices[0]]
@@ -183,10 +180,13 @@ def generate_text(prompt):
             return completion.choices[0].message.content
         except Exception as e:
             print(f"Groq also failed: {e}")
+    else:
+        print("GROQ_API_KEY is not set — no backup available, only Gemini was tried.")
 
     return (
-        "Maaf kijiye, is waqt AI system busy hai. Thori dair mein dobara "
-        f"try karein, ya seedha rabta karein: {TEAM_HEAD_NUMBER}"
+        "Is waqt thora zyada rush hai is liye jawab dene mein masla ho raha "
+        f"hai. Chand minute mein dobara message kar dein, ya seedha hamari "
+        f"team se baat kar lein: {TEAM_HEAD_NUMBER}"
     )
 
 
@@ -198,7 +198,7 @@ def rag_answer(user_question, voice=False):
             f"{TEAM_HEAD_NUMBER}"
         )
 
-    context_chunks = retrieve_chunks(user_question, top_k=8)
+    context_chunks = retrieve_chunks(user_question, top_k=6)
     context = "\n\n---\n\n".join(context_chunks)
 
     voice_rule = ""
@@ -235,19 +235,6 @@ what you know — speak naturally and confidently, the way a helpful human
 staff member would. Never mention "context", "the information provided",
 "based on the available data" or anything that reveals you're reading from a
 document.
-
-PRIORITY COURSES RULE: Leaders Academia's top-priority courses, in this exact
-order, are: {", ".join(PRIORITY_COURSES)}. Whenever you list or mention
-courses (e.g. "what courses do you have", "sary courses batayein"), ALWAYS
-include these priority courses first, in this order, before any other
-courses — even if they aren't in the CONTEXT below, you already know they
-exist and should name them.
-
-COURSE NAMES ONLY RULE: If the user is only asking WHAT courses exist / for
-a list of course NAMES (not asking for details about a specific course),
-reply with just a short list of course names — no descriptions, no syllabus,
-no pricing, 1-2 lines max. Only give full details (description, modules,
-pricing, duration) when the user asks about a SPECIFIC course by name.
 
 WHEN YOU DON'T KNOW: If a Leaders Academia question isn't answered by the
 CONTEXT, don't guess or invent details. Instead say naturally, in your own
@@ -328,8 +315,8 @@ def transcribe_audio(audio_bytes, mime_type):
             )
             return response.text.strip()
         except Exception as e:
-            if is_transient_error(e) and attempt == 0:
-                time.sleep(3)
+            if is_overloaded_error(e) and attempt == 0:
+                time.sleep(8)
                 continue
             print(f"Gemini transcription failed, falling back to Groq: {e}")
             break
@@ -538,9 +525,9 @@ async def receive_whatsapp_message(request: Request):
                     print(f"Voice transcription failed after retries: {e}")
                     send_whatsapp_message(
                         from_number,
-                        "Maaf kijiye, is waqt AI system busy hai. Thori dair "
-                        "mein dobara voice note bhej kar try karein, ya text "
-                        f"mein likh dein, ya seedha rabta karein: {TEAM_HEAD_NUMBER}",
+                        "Yeh voice note samajhne mein masla ho raha hai. "
+                        "Dobara bhej kar dekh lein, ya text mein likh dein, "
+                        f"ya seedha rabta karein: {TEAM_HEAD_NUMBER}",
                     )
                     user_text = None
 
