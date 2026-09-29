@@ -27,7 +27,18 @@ GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
 GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
-TEAM_HEAD_NUMBER = "0335-5229587"
+TEAM_HEAD_NUMBER = "0311-1534344"
+
+# Courses to always mention first, in this exact priority order, whenever the
+# bot talks about or lists courses — matches the priority order on the
+# website. These are injected directly into every prompt (not relying on PDF
+# retrieval), so they never get left out even if the retrieved chunks miss them.
+PRIORITY_COURSES = [
+    "AI & Automation",
+    "Web Development",
+    "Ecommerce",
+    "Digital Marketing",
+]
 
 HUMAN_HANDOFF_KEYWORDS = [
     "human", "real person", "agent", "representative",
@@ -41,10 +52,11 @@ if not GEMINI_API_KEY:
         "GEMINI_API_KEY not found. Add it under this project's "
         "Variables tab in the Railway dashboard."
     )
-# 20 s hard timeout so a slow/hung Gemini call can never stall a reply for a minute
+# 8 s hard timeout — if Gemini hasn't answered by then, fail fast and let
+# Groq (much faster) answer instead, so the user isn't left waiting.
 client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=20000),  # milliseconds
+    http_options=types.HttpOptions(timeout=8000),  # milliseconds
 )
 
 # ---------- Groq: free backup, used only when Gemini is busy/rate-limited ----------
@@ -224,6 +236,19 @@ staff member would. Never mention "context", "the information provided",
 "based on the available data" or anything that reveals you're reading from a
 document.
 
+PRIORITY COURSES RULE: Leaders Academia's top-priority courses, in this exact
+order, are: {", ".join(PRIORITY_COURSES)}. Whenever you list or mention
+courses (e.g. "what courses do you have", "sary courses batayein"), ALWAYS
+include these priority courses first, in this order, before any other
+courses — even if they aren't in the CONTEXT below, you already know they
+exist and should name them.
+
+COURSE NAMES ONLY RULE: If the user is only asking WHAT courses exist / for
+a list of course NAMES (not asking for details about a specific course),
+reply with just a short list of course names — no descriptions, no syllabus,
+no pricing, 1-2 lines max. Only give full details (description, modules,
+pricing, duration) when the user asks about a SPECIFIC course by name.
+
 WHEN YOU DON'T KNOW: If a Leaders Academia question isn't answered by the
 CONTEXT, don't guess or invent details. Instead say naturally, in your own
 words, that you don't have that detail on hand and give them this number to
@@ -303,8 +328,8 @@ def transcribe_audio(audio_bytes, mime_type):
             )
             return response.text.strip()
         except Exception as e:
-            if is_overloaded_error(e) and attempt == 0:
-                time.sleep(8)
+            if is_transient_error(e) and attempt == 0:
+                time.sleep(3)
                 continue
             print(f"Gemini transcription failed, falling back to Groq: {e}")
             break
