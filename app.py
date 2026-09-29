@@ -52,11 +52,11 @@ if not GEMINI_API_KEY:
         "GEMINI_API_KEY not found. Add it under this project's "
         "Variables tab in the Railway dashboard."
     )
-# 8 s hard timeout — if Gemini hasn't answered by then, fail fast and let
-# Groq (much faster) answer instead, so the user isn't left waiting.
+# 12 s hard timeout (Gemini requires a minimum of 10s) — if it hasn't answered
+# by then, fail fast and let Groq (much faster) answer instead.
 client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=8000),  # milliseconds
+    http_options=types.HttpOptions(timeout=12000),  # milliseconds
 )
 
 # ---------- Groq: free backup, used only when Gemini is busy/rate-limited ----------
