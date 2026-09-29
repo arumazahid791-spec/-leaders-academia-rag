@@ -24,7 +24,7 @@ from fastapi.responses import PlainTextResponse
 # ---------- Configuration ----------
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
+GROQ_CHAT_MODEL = "llama-3.1-8b-instant"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 TEAM_HEAD_NUMBER = "0311-1534344"
