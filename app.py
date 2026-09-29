@@ -41,11 +41,17 @@ if not GEMINI_API_KEY:
         "GEMINI_API_KEY not found. Add it under this project's "
         "Variables tab in the Railway dashboard."
     )
-client = genai.Client(api_key=GEMINI_API_KEY)
+# 20 s hard timeout so a slow/hung Gemini call can never stall a reply for a minute
+client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(timeout=20000),  # milliseconds
+)
 
 # ---------- Groq: free backup, used only when Gemini is busy/rate-limited ----------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+groq_client = (
+    Groq(api_key=GROQ_API_KEY, timeout=20.0, max_retries=1) if GROQ_API_KEY else None
+)
 
 # ---------- WhatsApp Cloud API config (from Meta's "Try it out" page) ----------
 WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN")
@@ -64,7 +70,7 @@ def load_pdf_text(path):
     return text
 
 
-def chunk_text(text, chunk_size=800, overlap=150):
+def chunk_text(text, chunk_size=1400, overlap=300):
     chunks = []
     start = 0
     while start < len(text):
@@ -88,7 +94,7 @@ print(f"Knowledge base ready: {len(chunks)} chunks indexed.")
 
 
 # ---------- RAG logic ----------
-def retrieve_chunks(query, top_k=4):
+def retrieve_chunks(query, top_k=8):
     query_vec = embed_model.encode([query], convert_to_numpy=True)
     _, indices = index.search(query_vec, top_k)
     return [chunks[i] for i in indices[0]]
@@ -99,32 +105,62 @@ def wants_human(text):
     return any(keyword in text for keyword in HUMAN_HANDOFF_KEYWORDS)
 
 
-def is_overloaded_error(e):
-    error_text = str(e)
-    return (
-        "429" in error_text
-        or "503" in error_text
-        or "quota" in error_text.lower()
-        or "UNAVAILABLE" in error_text
+def is_transient_error(e):
+    """Errors that mean 'Gemini is busy / out of quota / too slow right now'."""
+    text = str(e).lower()
+    return any(
+        marker in text
+        for marker in (
+            "429", "503", "500", "502", "504", "quota", "unavailable",
+            "resource_exhausted", "overloaded", "timeout", "timed out", "deadline",
+        )
     )
 
 
-def generate_text(prompt, max_retries=2):
-    """Try Gemini first; if it's busy or rate-limited, fall back to Groq —
-    same prompt goes to both, so the tone and style of the reply stays the
-    same no matter which one actually answers."""
-    for attempt in range(max_retries):
+# Circuit breaker: when Gemini fails, skip it for a few minutes and go straight to
+# the backup, instead of making every single message wait for Gemini to fail first.
+GEMINI_COOLDOWN_SECONDS = 180
+GEMINI_TTS_COOLDOWN_SECONDS = 600
+_gemini_down_until = 0.0
+_gemini_tts_down_until = 0.0
+
+
+def gemini_is_up():
+    return time.time() >= _gemini_down_until
+
+
+def mark_gemini_down():
+    global _gemini_down_until
+    _gemini_down_until = time.time() + GEMINI_COOLDOWN_SECONDS
+    print(f"Gemini marked unavailable for {GEMINI_COOLDOWN_SECONDS}s, using Groq meanwhile.")
+
+
+def gemini_tts_is_up():
+    return time.time() >= _gemini_tts_down_until
+
+
+def mark_gemini_tts_down():
+    global _gemini_tts_down_until
+    _gemini_tts_down_until = time.time() + GEMINI_TTS_COOLDOWN_SECONDS
+    print(f"Gemini TTS marked unavailable for {GEMINI_TTS_COOLDOWN_SECONDS}s, using edge-tts meanwhile.")
+
+
+def generate_text(prompt):
+    """Try Gemini first; if it's busy, out of quota or slow, fall back to Groq
+    right away — same prompt goes to both, so the tone and style of the reply
+    stays the same no matter which one actually answers."""
+    if gemini_is_up():
         try:
             response = client.models.generate_content(
                 model=GEMINI_MODEL_NAME, contents=prompt
             )
-            return response.text
+            if response.text:
+                return response.text
+            print("Gemini returned an empty reply, falling back to Groq.")
         except Exception as e:
-            if is_overloaded_error(e) and attempt < max_retries - 1:
-                time.sleep(8)
-                continue
             print(f"Gemini failed, falling back to Groq: {e}")
-            break
+            if is_transient_error(e):
+                mark_gemini_down()
 
     if groq_client:
         try:
@@ -150,7 +186,7 @@ def rag_answer(user_question, voice=False):
             f"{TEAM_HEAD_NUMBER}"
         )
 
-    context_chunks = retrieve_chunks(user_question, top_k=4)
+    context_chunks = retrieve_chunks(user_question, top_k=8)
     context = "\n\n---\n\n".join(context_chunks)
 
     voice_rule = ""
@@ -163,8 +199,10 @@ emojis, no symbols. If the user spoke Urdu or Hindi, reply in Urdu script
 """
 
     prompt = f"""You are the official AI assistant for Leaders Academia, chatting with
-someone on WhatsApp. You're warm, natural, and easy to talk to — like a real
-person on the team, not a scripted bot.
+someone on WhatsApp. Your tone is professional yet conversational — clear,
+warm, and easy to talk to, like a knowledgeable team member, not a stiff
+formal bot and not overly casual either. Keep this tone consistent in every
+reply.
 
 LANGUAGE RULE: Always reply in the SAME language and script the user used in
 their message (English, Urdu script, or Roman Urdu). Never force one language
@@ -282,8 +320,7 @@ def transcribe_audio(audio_bytes, mime_type):
     raise RuntimeError("Both Gemini and Groq failed to transcribe the audio.")
 
 
-URDU_VOICE = "ur-PK-UzmaNeural"
-ENGLISH_VOICE = "en-IN-NeerjaNeural"
+SINGLE_VOICE = "ur-PK-UzmaNeural"  # one consistent voice, used regardless of language
 
 
 def clean_text_for_speech(text):
@@ -300,7 +337,10 @@ def clean_text_for_speech(text):
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "gemini").lower()
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
 GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Sulafat")
-GEMINI_TTS_STYLE = "warm, friendly and natural, like a helpful person on a phone call"
+GEMINI_TTS_STYLE = (
+    "professional yet conversational — calm, clear, and warm, like an "
+    "experienced team member speaking on a call. Not overly casual, not stiff."
+)
 
 
 def gemini_text_to_speech(text):
@@ -352,10 +392,7 @@ async def edge_text_to_speech(text):
     Voice is picked by script: Urdu script -> Urdu voice, otherwise English."""
     import edge_tts
 
-    has_urdu_script = any("\u0600" <= ch <= "\u06ff" for ch in text)
-    voice = URDU_VOICE if has_urdu_script else ENGLISH_VOICE
-
-    communicate = edge_tts.Communicate(text, voice=voice, rate="+5%")
+    communicate = edge_tts.Communicate(text, voice=SINGLE_VOICE, rate="+5%")
     audio_bytes = b""
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
