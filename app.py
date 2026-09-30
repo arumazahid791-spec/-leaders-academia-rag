@@ -24,8 +24,8 @@ from fastapi.responses import PlainTextResponse
 # ---------- Configuration ----------
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
-GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
+GROQ_CHAT_MODEL = "openai/gpt-oss-120b"
+GROQ_WHISPER_MODEL = "whisper-large-v3"
 
 TEAM_HEAD_NUMBER = "0311-1534344"
 
@@ -34,8 +34,8 @@ TEAM_HEAD_NUMBER = "0311-1534344"
 PRIORITY_COURSES = [
     "AI Automation",
     "Web Development",
-    "E-commerce",
-    "Digital Marketing",
+    "Video Editing",
+    "Graphic Design",
 ]
 
 HUMAN_HANDOFF_KEYWORDS = [
@@ -100,6 +100,51 @@ dimension = chunk_embeddings.shape[1]
 index = faiss.IndexFlatL2(dimension)
 index.add(chunk_embeddings)
 print(f"Knowledge base ready: {len(chunks)} chunks indexed.")
+
+
+# ---------- Complete, guaranteed course name list ----------
+# Semantic search (top-k chunks) can miss some courses when the user asks for
+# a full list — this pulls every course name directly from the PDF's
+# "Courses & Curriculum Catalog" section, so listing is never incomplete.
+def extract_course_names(text):
+    start = text.find("Courses & Curriculum Catalog")
+    end = text.find("Instructors & Mentors Directory")
+    section = text[start:end] if start != -1 and end != -1 else text
+    lines = [line.strip() for line in section.split("\n")]
+    names = []
+    for i in range(len(lines) - 1):
+        if lines[i] and lines[i + 1].startswith("Category:"):
+            names.append(lines[i])
+    return names
+
+
+def order_by_priority(all_names, priority_keywords):
+    """Priority courses first (matched loosely — ignoring punctuation/spacing
+    differences like 'AI Automation' vs 'AI & Automation'), then everything
+    else in its original order."""
+    import re
+
+    def normalize(s):
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    ordered = []
+    used = set()
+    for keyword in priority_keywords:
+        keyword_norm = normalize(keyword)
+        for name in all_names:
+            if name not in used and keyword_norm in normalize(name):
+                ordered.append(name)
+                used.add(name)
+                break
+    for name in all_names:
+        if name not in used:
+            ordered.append(name)
+    return ordered
+
+
+ALL_COURSE_NAMES = order_by_priority(extract_course_names(full_text), PRIORITY_COURSES)
+print(f"Extracted {len(ALL_COURSE_NAMES)} course names: {ALL_COURSE_NAMES}")
+COURSE_LIST_TEXT = "\n".join(f"- {name}" for name in ALL_COURSE_NAMES)
 
 
 # ---------- RAG logic ----------
@@ -210,24 +255,38 @@ emojis, no symbols. If the user spoke Urdu or Hindi, reply in Urdu script
 (اردو). If the user spoke English, reply in English.
 """
 
-    prompt = f"""You are the official AI assistant for Leaders Academia, chatting with
-someone on WhatsApp. Your tone is professional yet conversational — clear,
-warm, and easy to talk to, like a knowledgeable team member, not a stiff
-formal bot and not overly casual either. Keep this tone consistent in every
-reply.
+    prompt = f"""You are Leaders Academia's official assistant, chatting with someone
+on WhatsApp. Always speak as a representative of Leaders Academia — never
+break character, never mention being an AI model. Your tone is professional
+— clear, polished, and courteous, like a knowledgeable staff member. No
+casual filler, no rambling, no off-topic chit-chat, no jokes. Keep this tone
+consistent in every reply.
 
 LANGUAGE RULE: Always reply in the SAME language and script the user used in
 their message (English, Urdu script, or Roman Urdu). Never force one language
 if the user wrote in a different one.
 
 SCOPE RULE: You only help with Leaders Academia — its courses, instructors,
-fees, schedules and platform. Friendly small talk is welcome (greetings,
-"how are you", thanks, goodbye) — answer those warmly and briefly, then
-gently steer back to how you can help with Leaders Academia. If someone asks
-for something unrelated to Leaders Academia (recipes, coding help, general
-knowledge, news, homework, etc.), politely say you can only help with
-Leaders Academia and invite them to ask about the courses or services. Do NOT
-provide the unrelated information, not even briefly.
+fees, schedules and platform. Greetings and basic pleasantries are fine —
+answer those briefly and professionally, then guide the conversation back to
+Leaders Academia. If someone asks for something unrelated (recipes, coding
+help, general knowledge, news, homework, etc.), politely say you can only
+help with Leaders Academia and ask what they'd like to know about the
+courses or services. Do NOT provide the unrelated information, not even
+briefly.
+
+DATA RULE: Only use these categories of information from the CONTEXT below:
+course details (name, description, modules, duration, pricing/payment),
+instructor details, and core platform information. If the CONTEXT contains
+anything outside these categories, ignore it completely — don't mention it,
+don't repeat it, even in passing.
+
+GUIDANCE RULE: When discussing or listing courses, briefly mention the real
+practical benefit or career value each one offers — help the person see why
+it's worth taking, the way a good advisor would, without being pushy or
+salesy. When it's natural (e.g. someone asking about courses in general or
+wanting more detail), point them to the website for the full picture:
+https://leadersacademia.com/
 
 LEADERS ACADEMIA RULE: For questions about courses, instructors, pricing,
 schedules or the platform, answer using the CONTEXT below as if it's simply
@@ -240,6 +299,13 @@ WHEN YOU DON'T KNOW: If a Leaders Academia question isn't answered by the
 CONTEXT, don't guess or invent details. Instead say naturally, in your own
 words, that you don't have that detail on hand and give them this number to
 reach the team head directly: {TEAM_HEAD_NUMBER}
+
+COMPLETE COURSE LIST (authoritative — this is every course we offer, already
+in the right order to mention them in): every time the user asks what
+courses are offered, or wants a list of all courses, use exactly this list,
+in exactly this order. Don't skip any, don't invent extra ones, don't
+reorder them yourself:
+{COURSE_LIST_TEXT}
 {voice_rule}
 CONTEXT:
 {context}
