@@ -18,8 +18,9 @@ from google.genai import types
 from groq import Groq
 import gradio as gr
 import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 # ---------- Configuration ----------
 PDF_PATH = "Leaders_Academia_Full_Data.pdf"  # must sit next to app.py in this repo
@@ -625,6 +626,170 @@ app = FastAPI()
 processed_message_ids = set()
 
 
+# ---------- Dashboard: live activity log ----------
+import datetime
+
+message_log = []  # flat, newest-last list of every in/out message, for the dashboard
+MAX_LOG_SIZE = 500  # keep memory bounded
+
+
+def log_message(phone, direction, msg_type, text):
+    """direction: 'in' (from a user) or 'out' (from the agent)."""
+    message_log.append({
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "phone": phone,
+        "direction": direction,
+        "type": msg_type,  # "text" or "voice"
+        "text": text,
+    })
+    if len(message_log) > MAX_LOG_SIZE:
+        del message_log[: len(message_log) - MAX_LOG_SIZE]
+
+
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "changeme")
+_dashboard_auth = HTTPBasic()
+
+
+def check_dashboard_auth(credentials: HTTPBasicCredentials = Depends(_dashboard_auth)):
+    import secrets
+
+    correct = secrets.compare_digest(credentials.password, DASHBOARD_PASSWORD)
+    if not correct:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return True
+
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Leaders Academia — Live Agent Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: -apple-system, Arial, sans-serif; margin: 0; background: #f4f5f7; color: #1a1a1a; }
+    header { background: #111827; color: white; padding: 14px 20px; }
+    header h1 { margin: 0; font-size: 18px; }
+    header p { margin: 2px 0 0; font-size: 12px; color: #9ca3af; }
+    .wrap { display: flex; height: calc(100vh - 56px); }
+    .col-convos { width: 280px; border-right: 1px solid #e5e7eb; overflow-y: auto; background: white; }
+    .col-feed { flex: 1; overflow-y: auto; padding: 16px; }
+    .convo { padding: 12px 16px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
+    .convo:hover { background: #f9fafb; }
+    .convo.active { background: #eef2ff; }
+    .convo .phone { font-weight: 600; font-size: 14px; }
+    .convo .meta { font-size: 12px; color: #6b7280; margin-top: 2px; }
+    .msg { max-width: 70%; margin: 8px 0; padding: 10px 14px; border-radius: 10px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; }
+    .msg.in { background: white; border: 1px solid #e5e7eb; }
+    .msg.out { background: #2563eb; color: white; margin-left: auto; }
+    .msg .tag { font-size: 11px; opacity: 0.7; display: block; margin-bottom: 4px; }
+    .stats { display: flex; gap: 20px; padding: 12px 20px; background: white; border-bottom: 1px solid #e5e7eb; font-size: 13px; }
+    .stats b { font-size: 16px; display: block; }
+    .empty { color: #9ca3af; text-align: center; margin-top: 40px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Leaders Academia — Live Agent Dashboard</h1>
+    <p>Auto-refreshes every 3 seconds</p>
+  </header>
+  <div class="stats" id="stats"></div>
+  <div class="wrap">
+    <div class="col-convos" id="convoList"></div>
+    <div class="col-feed" id="feed"><div class="empty">Select a conversation, or wait for new messages…</div></div>
+  </div>
+  <script>
+    let selectedPhone = null;
+
+    async function refresh() {
+      const [convoRes, actRes] = await Promise.all([
+        fetch('/dashboard/api/conversations').then(r => r.json()),
+        fetch('/dashboard/api/activity?limit=500').then(r => r.json()),
+      ]);
+
+      const convos = convoRes.conversations;
+      document.getElementById('stats').innerHTML =
+        `<div><b>${convos.length}</b>Active conversations</div>` +
+        `<div><b>${actRes.messages.length}</b>Messages logged (recent)</div>`;
+
+      const listEl = document.getElementById('convoList');
+      listEl.innerHTML = convos.map(c => `
+        <div class="convo ${c.phone === selectedPhone ? 'active' : ''}" onclick="selectConvo('${c.phone}')">
+          <div class="phone">${c.phone}</div>
+          <div class="meta">${c.message_count} messages · ${c.last_time || ''}</div>
+        </div>
+      `).join('') || '<div class="empty">No conversations yet</div>';
+
+      if (selectedPhone) {
+        renderFeed(actRes.messages.filter(m => m.phone === selectedPhone));
+      } else {
+        renderFeed(actRes.messages.slice(-50));
+      }
+    }
+
+    function renderFeed(messages) {
+      const feedEl = document.getElementById('feed');
+      if (!messages.length) {
+        feedEl.innerHTML = '<div class="empty">No messages yet</div>';
+        return;
+      }
+      feedEl.innerHTML = messages.map(m => `
+        <div class="msg ${m.direction}">
+          <span class="tag">${m.direction === 'in' ? m.phone : 'Agent'} · ${m.type} · ${m.time}</span>
+          ${escapeHtml(m.text)}
+        </div>
+      `).join('');
+      feedEl.scrollTop = feedEl.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    function selectConvo(phone) {
+      selectedPhone = phone;
+      refresh();
+    }
+
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page(auth: bool = Depends(check_dashboard_auth)):
+    return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/dashboard/api/activity")
+def dashboard_activity(limit: int = 200, auth: bool = Depends(check_dashboard_auth)):
+    return {"messages": message_log[-limit:]}
+
+
+@app.get("/dashboard/api/conversations")
+def dashboard_conversations(auth: bool = Depends(check_dashboard_auth)):
+    convos = []
+    for phone, history in conversation_history.items():
+        phone_messages = [m for m in message_log if m["phone"] == phone]
+        last_time = phone_messages[-1]["time"] if phone_messages else ""
+        convos.append({
+            "phone": phone,
+            "message_count": len(phone_messages),
+            "last_time": last_time,
+        })
+    convos.sort(key=lambda c: c["last_time"], reverse=True)
+    return {"conversations": convos}
+
+
 @app.get("/webhook")
 def verify_webhook(request: Request):
     """Meta calls this once, when you save the webhook URL, to confirm you
@@ -683,7 +848,13 @@ async def receive_whatsapp_message(request: Request):
                     user_text = None
 
             if user_text:
+                log_message(
+                    from_number, "in", "voice" if is_voice_message else "text", user_text
+                )
                 reply_text = rag_answer(user_text, user_id=from_number, voice=is_voice_message)
+                log_message(
+                    from_number, "out", "voice" if is_voice_message else "text", reply_text
+                )
 
                 if is_voice_message:
                     # Voice in, voice out — feels like a real conversation
