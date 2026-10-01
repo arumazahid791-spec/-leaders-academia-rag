@@ -154,6 +154,46 @@ def retrieve_chunks(query, top_k=6):
     return [chunks[i] for i in indices[0]]
 
 
+# ---------- Per-user conversation memory ----------
+# Keyed by WhatsApp number. Keeps the last few exchanges so follow-up
+# questions like "is course ka instructor kon hai" work correctly — without
+# this, every message was treated as a brand-new, context-free question.
+conversation_history = {}
+MAX_HISTORY_TURNS = 5  # user+assistant pairs kept per person
+
+
+def get_history(user_id):
+    return conversation_history.get(user_id, [])
+
+
+def add_to_history(user_id, role, text):
+    history = conversation_history.setdefault(user_id, [])
+    history.append((role, text))
+    # Keep only the most recent turns so the prompt doesn't grow forever
+    max_messages = MAX_HISTORY_TURNS * 2
+    if len(history) > max_messages:
+        conversation_history[user_id] = history[-max_messages:]
+
+
+def format_history(history):
+    if not history:
+        return "(no earlier messages — this is the start of the conversation)"
+    lines = []
+    for role, text in history:
+        speaker = "User" if role == "user" else "Assistant"
+        lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
+
+
+def build_retrieval_query(user_id, user_question):
+    """Pull in the last user message too, so a short follow-up like 'iska
+    instructor kon hai' still retrieves the RIGHT course's chunks, not a
+    random one."""
+    history = get_history(user_id)
+    recent_user_lines = [text for role, text in history[-4:] if role == "user"]
+    return " ".join(recent_user_lines + [user_question])
+
+
 def wants_human(text):
     text = text.lower()
     return any(keyword in text for keyword in HUMAN_HANDOFF_KEYWORDS)
@@ -235,15 +275,21 @@ def generate_text(prompt):
     )
 
 
-def rag_answer(user_question, voice=False):
+def rag_answer(user_question, user_id=None, voice=False):
     # Direct handoff — skip the model entirely for this case
     if wants_human(user_question):
-        return (
+        reply = (
             f"Zaroor! Aap hamari team head se seedha rabta kar sakte hain: "
             f"{TEAM_HEAD_NUMBER}"
         )
+        if user_id:
+            add_to_history(user_id, "user", user_question)
+            add_to_history(user_id, "assistant", reply)
+        return reply
 
-    context_chunks = retrieve_chunks(user_question, top_k=6)
+    history = get_history(user_id) if user_id else []
+    retrieval_query = build_retrieval_query(user_id, user_question) if user_id else user_question
+    context_chunks = retrieve_chunks(retrieval_query, top_k=6)
     context = "\n\n---\n\n".join(context_chunks)
 
     voice_rule = ""
@@ -266,6 +312,14 @@ LANGUAGE RULE: Always reply in the SAME language and script the user used in
 their message (English, Urdu script, or Roman Urdu). Never force one language
 if the user wrote in a different one.
 
+MEMORY RULE: You are in an ongoing conversation — CONVERSATION SO FAR below
+has everything said until now. Use it to understand what the user means by
+"this", "it", "the course", etc. Never ask the user to repeat something they
+already told you earlier in this conversation. Never re-explain something
+you already fully explained — if they're asking a focused follow-up (like
+just the instructor's name), give a short, direct answer to exactly that,
+not the whole course rundown again.
+
 SCOPE RULE: You only help with Leaders Academia — its courses, instructors,
 fees, schedules and platform. Greetings and basic pleasantries are fine —
 answer those briefly and professionally, then guide the conversation back to
@@ -279,7 +333,9 @@ DATA RULE: Only use these categories of information from the CONTEXT below:
 course details (name, description, modules, duration, pricing/payment),
 instructor details, and core platform information. If the CONTEXT contains
 anything outside these categories, ignore it completely — don't mention it,
-don't repeat it, even in passing.
+don't repeat it, even in passing. If the CONTEXT doesn't clearly name an
+instructor for the specific course being asked about, say you'll have the
+team confirm — never guess or attach the wrong instructor to a course.
 
 GUIDANCE RULE: When discussing or listing courses, briefly mention the real
 practical benefit or career value each one offers — help the person see why
@@ -287,6 +343,12 @@ it's worth taking, the way a good advisor would, without being pushy or
 salesy. When it's natural (e.g. someone asking about courses in general or
 wanting more detail), point them to the website for the full picture:
 https://leadersacademia.com/
+
+PRICING RULE: Don't lead with price. When introducing or describing a
+course, talk about what it covers and the value/benefit first. Only give the
+fee when the user specifically asks about cost/price/fees, or once you've
+already given them a real sense of the course's value. Never open a reply
+with pricing as the first thing said.
 
 LEADERS ACADEMIA RULE: For questions about courses, instructors, pricing,
 schedules or the platform, answer using the CONTEXT below as if it's simply
@@ -307,6 +369,9 @@ in exactly this order. Don't skip any, don't invent extra ones, don't
 reorder them yourself:
 {COURSE_LIST_TEXT}
 {voice_rule}
+CONVERSATION SO FAR:
+{format_history(history)}
+
 CONTEXT:
 {context}
 
@@ -315,12 +380,18 @@ USER MESSAGE: {user_question}
 Reply clearly, briefly, and naturally — like a real person texting back, not
 a formal report."""
 
-    return generate_text(prompt)
+    reply = generate_text(prompt)
+
+    if user_id:
+        add_to_history(user_id, "user", user_question)
+        add_to_history(user_id, "assistant", reply)
+
+    return reply
 
 
 # ---------- Gradio frontend ----------
 def chat_fn(message, history):
-    return rag_answer(message)
+    return rag_answer(message, user_id="gradio-demo-user")
 
 
 demo = gr.ChatInterface(
@@ -598,7 +669,7 @@ async def receive_whatsapp_message(request: Request):
                     user_text = None
 
             if user_text:
-                reply_text = rag_answer(user_text, voice=is_voice_message)
+                reply_text = rag_answer(user_text, user_id=from_number, voice=is_voice_message)
 
                 if is_voice_message:
                     # Voice in, voice out — feels like a real conversation
