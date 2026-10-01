@@ -295,10 +295,16 @@ def rag_answer(user_question, user_id=None, voice=False):
     voice_rule = ""
     if voice:
         voice_rule = """
-VOICE RULE: This reply will be spoken aloud as a voice note. Keep it short
-(2-3 sentences), warm and conversational. No lists, no bullet points, no
-emojis, no symbols. If the user spoke Urdu or Hindi, reply in Urdu script
-(اردو). If the user spoke English, reply in English.
+VOICE RULE: This reply will be spoken aloud as a voice note by a FEMALE
+voice — write it the way she would naturally say it out loud to a person
+sitting in front of her, not like a written announcement. Keep it short
+(2-3 sentences). No lists, no bullet points, no emojis, no symbols — nothing
+that only makes sense in writing. Avoid stiff, formal, or "literary" Urdu
+words (no heavy/classical vocabulary) — use the same everyday, casual Urdu
+words a real person uses when talking, the way friends or colleagues
+actually speak, not textbook Urdu. If the user spoke Urdu or Hindi, reply in
+Urdu script (اردو) using this natural spoken style. If the user spoke
+English, reply in natural spoken English the same way.
 """
 
     prompt = f"""You are Leaders Academia's official assistant, chatting with someone
@@ -309,8 +315,8 @@ casual filler, no rambling, no off-topic chit-chat, no jokes. Keep this tone
 consistent in every reply.
 
 GRAMMAR GENDER RULE: When writing in Urdu (script or Roman), always use
-MASCULINE verb forms when referring to yourself (e.g. "bata dunga", "kar
-dunga", "madad karunga" — not the feminine "dungi"/"karungi"). Stay
+FEMININE verb forms when referring to yourself (e.g. "bata dungi", "kar
+dungi", "madad karungi" — not the masculine "dunga"/"karunga"). Stay
 consistent with this in every reply, in both text and voice messages.
 
 LANGUAGE RULE: Always reply in the SAME language and script the user used in
@@ -476,7 +482,7 @@ def transcribe_audio(audio_bytes, mime_type):
     raise RuntimeError("Both Gemini and Groq failed to transcribe the audio.")
 
 
-SINGLE_VOICE = "ur-PK-AsadNeural"  # one consistent (male) voice, used regardless of language
+SINGLE_VOICE = "ur-PK-UzmaNeural"  # one consistent (female) voice, used regardless of language
 
 
 def clean_text_for_speech(text):
@@ -492,10 +498,11 @@ def clean_text_for_speech(text):
 # to edge-tts automatically if it fails). "edge" = always use edge-tts.
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "gemini").lower()
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
-GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Charon")  # calm, professional male voice
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Sulafat")  # warm, natural female voice
 GEMINI_TTS_STYLE = (
-    "professional yet conversational — calm, clear, and warm, like an "
-    "experienced team member speaking on a call. Not overly casual, not stiff."
+    "natural and conversational, like a real woman talking to a friend on a "
+    "call — warm, relaxed, human. Never robotic, never stiff, never reading "
+    "like an announcement."
 )
 
 
