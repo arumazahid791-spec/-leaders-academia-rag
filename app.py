@@ -715,15 +715,18 @@ processed_message_ids = set()
 # ====================== Google Sheets ======================
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
-STUDENTS_TAB = os.environ.get("GOOGLE_SHEET_TAB_NAME", "Students")
+STUDENTS_TAB = os.environ.get("GOOGLE_SHEET_TAB_NAME", "Student Leads")
+AGENT_NAME = os.environ.get("SHEET_AGENT_NAME", "AI Agent")
 SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
-STUDENT_HEADERS = ["Customer contact #", "Customer Name", "Remarks", "Interested course", "QA Remark",
+# Same layout as the team's daily sheet: A agent, B contact, C name, D remarks, E course (dropdown), F QA remark
+STUDENT_HEADERS = ["Agent name", "Customer contact #", "Customer Name", "Remarks", "interested course", "QA Remark",
                    "City", "Qualification", "Motive", "Status", "Discount Requested", "Head Reply"]
 SUMMARY_HEADERS = ["Time window", "Total numbers", "New", "Returning", "Interested", "Not Interested",
                    "Fee asked", "Discount requests", "Forwarded to head", "Voice notes received", "Media sent"]
 DETAIL_HEADERS = ["Window end", "Phone", "Name", "Student asked", "Agent replied", "Status"]
 _students = _summary = _details = None
 _row_of = {}
+_manual_rows = set()
 _sheet_lock = threading.Lock()
 
 if GOOGLE_SHEETS_CREDENTIALS_JSON and GOOGLE_SHEET_ID:
@@ -744,10 +747,33 @@ if GOOGLE_SHEETS_CREDENTIALS_JSON and GOOGLE_SHEET_ID:
                 ws.append_row(headers)
                 return ws
 
+        _students_existed = STUDENTS_TAB in [w.title for w in _ss.worksheets()]
         _students = _tab(STUDENTS_TAB, STUDENT_HEADERS)
         _summary = _tab("2 Hour Summary", SUMMARY_HEADERS)
         _details = _tab("2 Hour Details", DETAIL_HEADERS)
-        _row_of = {v: i + 1 for i, v in enumerate(_students.col_values(1)) if i > 0 and v}
+        if not _students_existed:
+            try:  # header look + frozen row + course dropdown (column E) for a brand-new tab
+                _reqs = [
+                    {"repeatCell": {"range": {"sheetId": _students.id, "startRowIndex": 0, "endRowIndex": 1},
+                                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
+                                             "backgroundColor": {"red": 0.6, "green": 0.6, "blue": 0.6}}},
+                                    "fields": "userEnteredFormat(textFormat,backgroundColor)"}},
+                    {"updateSheetProperties": {"properties": {"sheetId": _students.id,
+                                               "gridProperties": {"frozenRowCount": 1}},
+                                               "fields": "gridProperties.frozenRowCount"}}]
+                if ALL_COURSE_NAMES:
+                    _reqs.append({"setDataValidation": {
+                        "range": {"sheetId": _students.id, "startRowIndex": 1, "endRowIndex": 2000,
+                                  "startColumnIndex": 4, "endColumnIndex": 5},
+                        "rule": {"condition": {"type": "ONE_OF_LIST",
+                                               "values": [{"userEnteredValue": c} for c in ALL_COURSE_NAMES]},
+                                 "showCustomUi": True, "strict": False}}})
+                _ss.batch_update({"requests": _reqs})
+            except Exception as e:
+                print(f"Students tab styling skipped: {e}")
+        _colA = _students.col_values(1)
+        _row_of = {_norm_phone(v): i + 1 for i, v in enumerate(_students.col_values(2)) if i > 0 and v}
+        _manual_rows = {i + 1 for i, v in enumerate(_colA) if i > 0 and v.strip() and v.strip() != AGENT_NAME}
         print("Google Sheets connected.")
     except Exception as e:
         print(f"Google Sheets setup failed (sheets skipped): {e}")
@@ -755,28 +781,59 @@ else:
     print("Google Sheets env vars not set - sheets disabled.")
 
 
+def _norm_phone(v):
+    d = re.sub(r"\D", "", str(v))
+    return d[-10:] if len(d) >= 10 else d
+
+
+def _match_course(c):
+    """Map the AI's course text to the exact dropdown name when possible."""
+    n = lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower())
+    if not c:
+        return ""
+    for name in ALL_COURSE_NAMES:
+        if n(c) == n(name) or (n(c) and (n(c) in n(name) or n(name) in n(c))):
+            return name
+    return c
+
+
 def sync_student_row(phone):
-    """One row per student, updated live. Never touches the 'QA Remark' column (E)."""
+    """One row per student, updated live. Never touches the 'QA Remark' column (F).
+    Rows typed by hand (agent name other than AGENT_NAME) are only topped up, never overwritten."""
     if not _students:
         return
     try:
         p = get_profile(phone)
-        left = [phone, p["name"], p["remarks"], p["course"]]
-        right = [p["city"], p["qualification"], p["motive"], p["status"], "Yes" if p["discount"] else "No"]
+        key = _norm_phone(phone)
+        course = _match_course(p["course"])
+        extra = [p["city"], p["qualification"], p["motive"], p["status"], "Yes" if p["discount"] else "No"]
         with _sheet_lock:
-            r = _row_of.get(phone)
+            r = _row_of.get(key)
             if not r:
-                res = _students.append_row(left + [""] + right + [""], value_input_option="RAW")
+                res = _students.append_row([AGENT_NAME, phone, p["name"], p["remarks"], course, ""] + extra + [""],
+                                           value_input_option="RAW")
                 m = re.search(r"!A(\d+)", res["updates"]["updatedRange"])
                 r = int(m.group(1))
-                _row_of[phone] = r
+                _row_of[key] = r
+            elif r in _manual_rows:
+                cur = _students.row_values(r)
+                cur += [""] * (6 - len(cur))
+                upd = [{"range": f"G{r}:K{r}", "values": [extra]}]
+                if p["name"] and not cur[2].strip():
+                    upd.append({"range": f"C{r}", "values": [[p["name"]]]})
+                if course and not cur[4].strip():
+                    upd.append({"range": f"E{r}", "values": [[course]]})
+                last = (p["remarks"] or "").split(" | ")[-1].strip()
+                if last and last not in cur[3]:
+                    upd.append({"range": f"D{r}", "values": [[(cur[3] + " | " if cur[3].strip() else "") + last]]})
+                _students.batch_update(upd, value_input_option="RAW")
             else:
-                _students.batch_update([{"range": f"A{r}:D{r}", "values": [left]},
-                                        {"range": f"F{r}:J{r}", "values": [right]}],
+                _students.batch_update([{"range": f"B{r}:E{r}", "values": [[phone, p["name"], p["remarks"], course]]},
+                                        {"range": f"G{r}:K{r}", "values": [extra]}],
                                        value_input_option="RAW")
             yellow = {"backgroundColor": {"red": 1, "green": 1, "blue": 0}}
             white = {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}
-            _students.format(f"A{r}:K{r}", yellow if p["status"] == "Not Interested" else white)
+            _students.format(f"A{r}:L{r}", yellow if p["status"] == "Not Interested" else white)
     except Exception as e:
         print(f"Student sheet sync failed for {phone}: {e}")
 
@@ -810,6 +867,7 @@ CHAT:
         sync_student_row(phone)
     except Exception as e:
         print(f"Profile extraction failed for {phone}: {e}")
+        sync_student_row(phone)
 
 
 def write_summary(start, end):
@@ -1156,7 +1214,11 @@ fetch('/dashboard/api/chats').then(r=>{if(r.ok){$('#login').style.display='none'
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page():
-    return HTMLResponse(DASHBOARD_HTML)
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html"), encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    except Exception:
+        return HTMLResponse(DASHBOARD_HTML)
 
 
 from fastapi.responses import RedirectResponse
