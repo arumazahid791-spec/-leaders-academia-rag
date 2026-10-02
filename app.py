@@ -405,10 +405,12 @@ English, reply in natural spoken English the same way.
     examples_text = good_examples_text()
     profile = get_profile(user_id) if user_id else {"name": "", "city": "", "qualification": "", "motive": "",
                                                     "course": "", "status": "", "no_voice": 0}
-    prompt = f"""You are Leaders Academia's assistant, chatting with a potential student on WhatsApp.
-Sound like a warm, natural, professional team member. Never claim to be a human and never use a staff
-member's name as your own. If someone sincerely asks whether you are a bot/AI/human, say plainly that you
-are Leaders Academia's AI assistant and offer the team head's number.
+    prompt = f"""You are a Student Counselor from the Student Care Department of Leaders Academia, chatting with a
+potential student on WhatsApp. When you greet or introduce yourself, say you are a student counselor from Leaders
+Academia's Student Care Department. Do not call yourself an "AI assistant", "bot" or "chatbot" on your own.
+Sound like a warm, natural, professional team member. Never use a real staff member's name as your own and never
+claim to be a human. If someone sincerely asks whether you are a bot, AI or human, never deny it: say honestly that
+you are an automated (AI-powered) counselor of the Student Care Department, and offer the team head's number.
 
 STYLE (most important): write like a real person texting: 1 to 3 short lines. No long paragraphs, no
 filler such as "main aapko yakeen dilati hoon" or "I assure you". Never end with a generic question like
@@ -1155,6 +1157,53 @@ def dash_media_del(mid: int, auth: bool = Depends(check_auth)):
 def dash_media_file(mid: int, auth: bool = Depends(check_auth)):
     r = db("SELECT mime,data FROM media WHERE id=?", (mid,))
     return Response(r[0]["data"], media_type=r[0]["mime"]) if r else Response(status_code=404)
+
+
+@app.get("/dashboard/api/analytics")
+def dash_analytics(days: int = 14, tz: int = 0, auth: bool = Depends(check_auth)):
+    """Daily numbers for the Analytics page. tz = browser offset from UTC in minutes (server time is stored as UTC)."""
+    days = max(1, min(days, 90))
+    tz = max(-840, min(tz, 840))
+    off = f"{tz:+d} minutes"
+    today = (datetime.datetime.now() + datetime.timedelta(minutes=tz)).date()
+    labels = [(today - datetime.timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+    since = (datetime.datetime.now() - datetime.timedelta(days=days + 1)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def per_day(rows):
+        m = {r["d"]: r["c"] for r in rows}
+        return [m.get(d, 0) for d in labels]
+
+    msg_in = per_day(db("SELECT date(time,?) d, COUNT(*) c FROM messages WHERE direction='in' AND time>=? GROUP BY d", (off, since)))
+    msg_out = per_day(db("SELECT date(time,?) d, COUNT(*) c FROM messages WHERE direction='out' AND time>=? GROUP BY d", (off, since)))
+    voice = per_day(db("SELECT date(time,?) d, COUNT(*) c FROM messages WHERE direction='in' AND type='voice' AND time>=? GROUP BY d", (off, since)))
+    active = per_day(db("SELECT date(time,?) d, COUNT(DISTINCT phone) c FROM messages WHERE direction='in' AND time>=? GROUP BY d", (off, since)))
+    fwd = per_day(db("SELECT date(fwd_time,?) d, COUNT(*) c FROM profiles WHERE fwd_time!='' AND fwd_time>=? GROUP BY d", (off, since)))
+    media = per_day(db("SELECT date(time,?) d, COUNT(*) c FROM media_sent WHERE time>=? GROUP BY d", (off, since)))
+    new_by_status = {st: [0] * len(labels) for st in STATUSES}
+    for r in db("""SELECT date(f,?) d, status, COUNT(*) c FROM
+                   (SELECT MIN(m.time) f, p.status status FROM messages m JOIN profiles p ON p.phone=m.phone GROUP BY m.phone)
+                   GROUP BY d, status""", (off,)):
+        if r["d"] in labels and r["status"] in new_by_status:
+            new_by_status[r["status"]][labels.index(r["d"])] = r["c"]
+    hours = [0] * 24
+    for r in db("SELECT CAST(strftime('%H',time,?) AS INTEGER) h, COUNT(*) c FROM messages WHERE direction='in' AND time>=? GROUP BY h", (off, since)):
+        hours[r["h"]] = r["c"]
+    status = {r["status"]: r["c"] for r in db(
+        "SELECT status, COUNT(*) c FROM profiles WHERE phone IN (SELECT phone FROM messages) GROUP BY status")}
+    courses = [[r["n"], r["c"]] for r in db(
+        """SELECT MIN(course) n, COUNT(*) c FROM profiles WHERE course!='' AND phone IN (SELECT phone FROM messages)
+           GROUP BY lower(trim(course)) ORDER BY c DESC LIMIT 8""")]
+    cities = [[r["n"], r["c"]] for r in db(
+        """SELECT MIN(city) n, COUNT(*) c FROM profiles WHERE city!='' AND phone IN (SELECT phone FROM messages)
+           GROUP BY lower(trim(city)) ORDER BY c DESC LIMIT 6""")]
+    total_students = sum(status.values())
+    return {"labels": labels, "msg_in": msg_in, "msg_out": msg_out, "voice": voice, "active": active,
+            "fwd": fwd, "media": media, "new_by_status": new_by_status, "hours": hours, "status": status,
+            "courses": courses, "cities": cities,
+            "totals": {"students": total_students,
+                       "messages": db("SELECT COUNT(*) c FROM messages")[0]["c"],
+                       "forwarded": db("SELECT COUNT(*) c FROM profiles WHERE fwd_count>0")[0]["c"],
+                       "discount": db("SELECT COUNT(*) c FROM profiles WHERE discount=1")[0]["c"]}}
 
 
 DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Leaders Academia Dashboard</title>
