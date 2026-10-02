@@ -1159,7 +1159,16 @@ def dashboard_page():
     return HTMLResponse(DASHBOARD_HTML)
 
 
-app = gr.mount_gradio_app(app, demo, path="/")
+from fastapi.responses import RedirectResponse
+
+
+@app.get("/", include_in_schema=False)
+def root_redirect():
+    return RedirectResponse("/dashboard")
+
+
+# The Gradio test chat now lives at /test; the main address opens the dashboard.
+app = gr.mount_gradio_app(app, demo, path="/test")
 
 if __name__ == "__main__":
     import uvicorn
