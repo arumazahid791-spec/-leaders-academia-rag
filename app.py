@@ -716,7 +716,23 @@ processed_message_ids = set()
 
 # ====================== Google Sheets ======================
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+# Paste your Google Sheet link (or just its ID) between the quotes to use it directly from the code.
+# If this is filled in, it wins over the Railway variable GOOGLE_SHEET_ID.
+GOOGLE_SHEET_ID_OVERRIDE = "https://docs.google.com/spreadsheets/d/1XOIWcVnmmc7XQLN1lL27B0zBWQYEQX30whD7R0_Mn8E/edit?usp=sharing"
+GOOGLE_SHEET_ID = (GOOGLE_SHEET_ID_OVERRIDE or os.environ.get("GOOGLE_SHEET_ID") or "").strip()
+_m = re.search(r"/d/([A-Za-z0-9_-]+)", GOOGLE_SHEET_ID)  # accept a pasted full sheet URL too
+if _m:
+    GOOGLE_SHEET_ID = _m.group(1)
+GOOGLE_SHEET_ID = GOOGLE_SHEET_ID or None
+
+
+def _friendly_sheet_error(e):
+    msg = f"{type(e).__name__}: {e}"
+    if "<!DOCTYPE" in msg or "<html" in msg.lower():
+        return ("Google sent back a web page instead of sheet data. Most likely GOOGLE_SHEET_ID is wrong "
+                "(it must be only the code between /d/ and /edit in the sheet link) or the sheet is not a normal "
+                f"Google Sheet / not shared with the service account. Current ID length: {len(GOOGLE_SHEET_ID or '')} (normally 44).")
+    return msg[:300]
 STUDENTS_TAB = os.environ.get("GOOGLE_SHEET_TAB_NAME", "Student Leads")
 AGENT_NAME = os.environ.get("SHEET_AGENT_NAME", "AI Agent")
 SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
@@ -784,7 +800,7 @@ if GOOGLE_SHEETS_CREDENTIALS_JSON and GOOGLE_SHEET_ID:
         _sheet_state.update(connected=True, tab=STUDENTS_TAB, error="")
         print("Google Sheets connected.")
     except Exception as e:
-        _sheet_state["error"] = f"{type(e).__name__}: {e}"[:300] or "unknown error"
+        _sheet_state["error"] = _friendly_sheet_error(e)
         print(f"Google Sheets setup failed (sheets skipped): {e}")
 else:
     _missing = [n for n, v in (("GOOGLE_SHEETS_CREDENTIALS_JSON", GOOGLE_SHEETS_CREDENTIALS_JSON), ("GOOGLE_SHEET_ID", GOOGLE_SHEET_ID)) if not v]
@@ -847,7 +863,7 @@ def sync_student_row(phone):
             _students.format(f"A{r}:L{r}", yellow if p["status"] == "Not Interested" else white)
         _sheet_state["last_ok"] = now()
     except Exception as e:
-        _sheet_state["last_error"] = f"{now()} UTC - {type(e).__name__}: {e}"[:300]
+        _sheet_state["last_error"] = f"{now()} UTC - {_friendly_sheet_error(e)}"[:400]
         print(f"Student sheet sync failed for {phone}: {e}")
 
 
