@@ -7,7 +7,14 @@ Gemini (context-grounded answer) -> Gradio chat UI.
 """
 
 import asyncio
+import datetime
+import hashlib
+import hmac
+import json
 import os
+import re
+import sqlite3
+import threading
 import time
 
 from pypdf import PdfReader
@@ -159,21 +166,108 @@ def retrieve_chunks(query, top_k=6):
 # Keyed by WhatsApp number. Keeps the last few exchanges so follow-up
 # questions like "is course ka instructor kon hai" work correctly — without
 # this, every message was treated as a brand-new, context-free question.
-conversation_history = {}
-MAX_HISTORY_TURNS = 5  # user+assistant pairs kept per person
+# ---------- Persistent storage (SQLite) ----------
+# Chats, student profiles, media and follow-up state live here, so a restart or
+# redeploy never wipes them. On Railway attach a Volume mounted at /data.
+DB_PATH = os.environ.get("DB_PATH") or ("/data/leaders.db" if os.path.isdir("/data") else "leaders.db")
+TEAM_HEAD_NAME = "Sir Intasham"
+STATUSES = ("Interested", "Not Interested", "Follow-up Needed", "Enrolled")
+_db_lock = threading.Lock()
+_db = sqlite3.connect(DB_PATH, check_same_thread=False)
+_db.row_factory = sqlite3.Row
+_db.executescript("""
+CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT, time TEXT,
+  direction TEXT, type TEXT, text TEXT, good INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_msg_phone ON messages(phone);
+CREATE TABLE IF NOT EXISTS profiles(phone TEXT PRIMARY KEY, name TEXT DEFAULT '', city TEXT DEFAULT '',
+  qualification TEXT DEFAULT '', motive TEXT DEFAULT '', course TEXT DEFAULT '',
+  status TEXT DEFAULT 'Follow-up Needed', remarks TEXT DEFAULT '', discount INTEGER DEFAULT 0,
+  no_voice INTEGER DEFAULT 0, fwd_count INTEGER DEFAULT 0, fwd_time TEXT DEFAULT '',
+  last_in TEXT DEFAULT '', followup_sent INTEGER DEFAULT 0, checkin_sent INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS media(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, keywords TEXT, mime TEXT, data BLOB);
+CREATE TABLE IF NOT EXISTS media_sent(phone TEXT, media_id INTEGER, time TEXT);
+""")
+
+
+def now():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def db(sql, args=(), write=False):
+    with _db_lock:
+        cur = _db.execute(sql, args)
+        if write:
+            _db.commit()
+            return cur.lastrowid
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_profile(phone):
+    rows = db("SELECT * FROM profiles WHERE phone=?", (phone,))
+    if not rows:
+        db("INSERT INTO profiles(phone) VALUES(?)", (phone,), write=True)
+        rows = db("SELECT * FROM profiles WHERE phone=?", (phone,))
+    return rows[0]
+
+
+def update_profile(phone, **fields):
+    if fields:
+        get_profile(phone)
+        cols = ", ".join(f"{k}=?" for k in fields)
+        db(f"UPDATE profiles SET {cols} WHERE phone=?", (*fields.values(), phone), write=True)
+
+
+def log_message(phone, direction, msg_type, text):
+    db("INSERT INTO messages(phone,time,direction,type,text) VALUES(?,?,?,?,?)",
+       (phone, now(), direction, msg_type, text), write=True)
+    if direction == "in":
+        update_profile(phone, last_in=now())
 
 
 def get_history(user_id):
-    return conversation_history.get(user_id, [])
+    """Last messages from the database. The newest incoming message is dropped
+    because it is passed to the model separately as USER MESSAGE."""
+    rows = db("SELECT direction,text FROM messages WHERE phone=? ORDER BY id DESC LIMIT 13", (user_id,))[::-1]
+    if rows and rows[-1]["direction"] == "in":
+        rows = rows[:-1]
+    return [("user" if r["direction"] == "in" else "assistant", r["text"]) for r in rows]
 
 
 def add_to_history(user_id, role, text):
-    history = conversation_history.setdefault(user_id, [])
-    history.append((role, text))
-    # Keep only the most recent turns so the prompt doesn't grow forever
-    max_messages = MAX_HISTORY_TURNS * 2
-    if len(history) > max_messages:
-        conversation_history[user_id] = history[-max_messages:]
+    pass  # messages are saved by log_message()
+
+
+def profile_text(p):
+    return (f"name={p['name'] or 'unknown'}; city={p['city'] or 'unknown'}; "
+            f"qualification={p['qualification'] or 'unknown'}; motive={p['motive'] or 'unknown'}; "
+            f"course={p['course'] or 'unknown'}; status={p['status']}; "
+            f"NO_VOICE={'yes' if p['no_voice'] else 'no'}")
+
+
+def good_examples_text():
+    rows = db("""SELECT m.text AS reply,
+      (SELECT q.text FROM messages q WHERE q.phone=m.phone AND q.id<m.id AND q.direction='in'
+       ORDER BY q.id DESC LIMIT 1) AS q FROM messages m WHERE m.good=1 ORDER BY m.id DESC LIMIT 5""")
+    if not rows:
+        return "(none yet)"
+    return "\n\n".join(f"Student: {r['q']}\nGood reply: {r['reply']}" for r in rows)
+
+
+def record_forward_if_needed(phone, reply_text):
+    if "[[HEAD]]" in reply_text or TEAM_HEAD_NUMBER in reply_text:
+        p = get_profile(phone)
+        update_profile(phone, fwd_count=p["fwd_count"] + 1, fwd_time=now(), checkin_sent=0)
+        return True
+    return False
+
+
+FEES_TEXT = """Full Course (2 months: month 1 structured learning, month 2 internship; certificate + internship letter):
+AI & Automation, Digital Marketing, Ecommerce, English Communication, Graphic Design, Web Development = PKR 30,000.
+Video Editing & Animation = PKR 25,000. IT Fundamentals = PKR 20,000. Entrepreneurship Program = PKR 40,000.
+Short Course (2 weeks, any course, certificate) = PKR 5,000 flat.
+AI Automation: installments available; paying the full fee at once gives PKR 5,000 discount.
+Scholarship / discount requests are decided by the team head.
+Address: F Block, Satellite Town, New Katarian Road, Rawalpindi. Courses are available online and onsite."""
 
 
 def format_history(history):
@@ -308,107 +402,74 @@ Urdu script (اردو) using this natural spoken style. If the user spoke
 English, reply in natural spoken English the same way.
 """
 
-    prompt = f"""You are Leaders Academia's official assistant, chatting with someone
-on WhatsApp. Always speak as a representative of Leaders Academia — never
-break character, never mention being an AI model. Your tone is that of a friendly, confident admissions officer
-texting on WhatsApp: short, warm, natural, typed the way a real person types.
-Never write essay-style paragraphs. No corporate phrases ("main aapko yakeen
-dilati hoon", "humari credibility..."), no thanking the person for every
-message, no repeating back what they just told you. Sound like a human
-texting, not a brochure. Keep this tone consistent in every reply.
+    examples_text = good_examples_text()
+    profile = get_profile(user_id) if user_id else {"name": "", "city": "", "qualification": "", "motive": "",
+                                                    "course": "", "status": "", "no_voice": 0}
+    prompt = f"""You are Leaders Academia's assistant, chatting with a potential student on WhatsApp.
+Sound like a warm, natural, professional team member. Never claim to be a human and never use a staff
+member's name as your own. If someone sincerely asks whether you are a bot/AI/human, say plainly that you
+are Leaders Academia's AI assistant and offer the team head's number.
 
-LENGTH RULE: Answer ONLY what was asked. Normal reply: 1-3 short lines
-(under about 280 characters). Explaining a course: at most 4-5 short lines.
-No bullet-point walls, no long intros. Share the website link only if they ask
-for more details.
+STYLE (most important): write like a real person texting: 1 to 3 short lines. No long paragraphs, no
+filler such as "main aapko yakeen dilati hoon" or "I assure you". Never end with a generic question like
+"kya main aur madad kar sakti hoon?". Ask a question only when you truly need the answer. Use points/emojis
+and a longer message ONLY when the student asks for full details, or when NO_VOICE=yes and the answer is long.
 
-ENDING RULE: Never end a message with a filler question such as "Kya main aur
-madad kar sakti hun?" or "Kuch aur janna chahenge?" or "Kya aap schedule jan-
-na chahte hain?". Finish after giving the answer. The ONLY question you may
-ask is the enrollment form request below.
+APPROVED EXAMPLES of replies the owner liked (copy this style):
+{examples_text}
 
-GRAMMAR GENDER RULE: When writing in Urdu (script or Roman), always use
-FEMININE verb forms when referring to yourself (e.g. "bata dungi", "kar
-dungi", "madad karungi" — not the masculine "dunga"/"karunga"). Stay
-consistent with this in every reply, in both text and voice messages.
+GRAMMAR GENDER RULE: in Urdu/Roman Urdu always use FEMININE verb forms for yourself ("bata dungi", "karungi").
+LANGUAGE RULE: reply in the SAME language/script the student used. If they write English, reply fully in
+English. Roman Urdu -> Roman Urdu. Urdu script -> Urdu script.
 
-LANGUAGE RULE: Always reply in the SAME language and script the user used in
-their message (English, Urdu script, or Roman Urdu). Never force one language
-if the user wrote in a different one.
+KNOWN STUDENT INFO: {profile_text(profile) if user_id else 'n/a'}
+Never ask again for anything already known above or already given in the conversation. If the name is
+unknown and the student shows interest, ask ONCE in a short form-like text, e.g. "Aap apna naam aur city
+is format mein bhej dein:\nName:\nCity:" (English version for English chats). Use their name naturally.
 
-MEMORY RULE: You are in an ongoing conversation — CONVERSATION SO FAR below
-has everything said until now. Use it to understand what the user means by
-"this", "it", "the course", etc. Never ask the user to repeat something they
-already told you earlier in this conversation. Never re-explain something
-you already fully explained — if they're asking a focused follow-up (like
-just the instructor's name), give a short, direct answer to exactly that,
-not the whole course rundown again.
+MEMORY RULE: use CONVERSATION SO FAR to understand "this/it/the course". Never re-explain what you already
+explained; for a focused follow-up give a short, direct answer.
 
-SCOPE RULE: You only help with Leaders Academia — its courses, instructors,
-fees, schedules and platform. Greetings and basic pleasantries are fine —
-answer those briefly and professionally, then guide the conversation back to
-Leaders Academia. If someone asks for something unrelated (recipes, coding
-help, general knowledge, news, homework, etc.), politely say you can only
-help with Leaders Academia and ask what they'd like to know about the
-courses or services. Do NOT provide the unrelated information, not even
-briefly.
+SCOPE RULE: only Leaders Academia (courses, instructors, fees, schedules, platform). Greetings are fine;
+for unrelated requests politely say you can only help with Leaders Academia.
 
-DATA RULE: Only use these categories of information from the CONTEXT below:
-course details (name, description, modules, duration, pricing/payment),
-instructor details, and core platform information. If the CONTEXT contains
-anything outside these categories, ignore it completely — don't mention it,
-don't repeat it, even in passing. If the CONTEXT doesn't clearly name an
-instructor for the specific course being asked about, say you'll have the
-team confirm — never guess or attach the wrong instructor to a course.
+DATA RULE: use only course, instructor, fee and platform details from CONTEXT / FEES below. If the instructor
+for a course isn't clearly named, say the team will confirm. Never guess.
 
-GUIDANCE RULE: This is mandatory — whenever you name or describe a specific
-course, you MUST include a short line on the real practical benefit or
-career value it offers (why it's worth taking), the way a good advisor
-would, without being pushy or salesy. Never describe a course without this.
-When it's natural (e.g. someone wanting more detail), point them to the
-website for the full picture: https://leadersacademia.com/
+GUIDANCE RULE: when you FIRST describe a course, add one short line on its real practical/career benefit.
+Website for more: https://leadersacademia.com/ (only when natural).
 
-PRICING RULE: This is a hard rule — follow it exactly. Never state a fee or
-price unless the user's message explicitly asks about cost, price, fees, or
-payment (words like "fee", "price", "kitna", "cost", "kharcha", "payment").
-When someone asks about a course in general, describe what it teaches and
-the real career/practical benefit it gives them — nothing about money at
-all. If they then separately ask about price, give it briefly and factually,
-without repeating the whole course description again.
+PRICING RULE: state a fee only when the student asks about cost/fees/payment. Use the FEES below.
+Never give bank / JazzCash / Easypaisa account numbers - say the team head will share payment details.
 
-LEAD CAPTURE RULE: When someone wants to enroll/join, or asks about fee or
-payment, AND KNOWN STUDENT INFO below shows the name or city as unknown, send
-this form ONCE (one short line before it, then exactly this layout, in the
-user's language):
-Enrollment ke liye ye details bhej dein:
-Name:
-City:
-Course:
-Never ask for the name or city in a normal sentence, never ask twice, and
-never ask for anything already known in KNOWN STUDENT INFO. When they send
-their details, confirm in one short line that registration is noted and the
-team will contact them. Use their name only occasionally, naturally.
+REVIEWS: never volunteer that there are no reviews. If asked, be honest but positive: we are a growing
+academy with new batches, and the team head can connect them with students / answer in detail.
 
-LEADERS ACADEMIA RULE: For questions about courses, instructors, pricing,
-schedules or the platform, answer using the CONTEXT below as if it's simply
-what you know — speak naturally and confidently, the way a helpful human
-staff member would. Never mention "context", "the information provided",
-"based on the available data" or anything that reveals you're reading from a
-document.
+ENROLLMENT RULE: if the student wants to enroll / take admission / join / register / pay, do NOTHING else:
+reply in 1-2 short lines that the team head will complete the enrollment and that you are sharing the
+number, then end with [[HEAD]]. No course pitch, no extra questions.
 
-WHEN YOU DON'T KNOW: If a Leaders Academia question isn't answered by the
-CONTEXT, don't guess or invent details. Instead say naturally, in your own
-words, that you don't have that detail on hand and say you'll have {TEAM_HEAD_NAME} (team head) help and give his number: {TEAM_HEAD_NUMBER}
+FEES-TOO-HIGH FLOW (when the student says fees are high): ask ONE thing per message.
+ 1) address them by name (if known) and ask their qualification, 2) ask their motive for the course (job,
+ freelancing, own business...), 3) respond to their level honestly: for students ask whether their degree
+ gives practical job-ready skills and explain how this course adds them; for beginners/matric/inter stress
+ skill-before-degree; for working people stress extra income. Never claim universities don't give jobs and
+ never guarantee a job. 4) then state the total fee of the course they want, say our mission is to empower
+ Pakistani youth, that the team head is very cooperative and a discount may be possible, that you are
+ passing their request to the head, and share the number with [[HEAD]], asking them to tell you what the
+ head said. Never promise a specific discount. Never say you emailed anyone.
 
-COMPLETE COURSE LIST (authoritative — this is every course we offer, already
-in the right order to mention them in): every time the user asks what
-courses are offered, or wants a list of all courses, use exactly this list,
-in exactly this order. Don't skip any, don't invent extra ones, don't
-reorder them yourself:
+TEAM HEAD NUMBER: never write the digits yourself. Write a short sentence such as "main number share kar
+rahi hoon" (or "I'm sharing the number") and put [[HEAD]] at the end of it.
+WHEN YOU DON'T KNOW something about Leaders Academia: say naturally you don't have that detail and share
+the team head the same way ([[HEAD]]).
+
+COMPLETE COURSE LIST (authoritative; keep this order, skip none, invent none):
 {COURSE_LIST_TEXT}
-{voice_rule}
-{lead_info_text(user_id)}
 
+FEES AND LOCATION (authoritative):
+{FEES_TEXT}
+{voice_rule}
 CONVERSATION SO FAR:
 {format_history(history)}
 
@@ -417,7 +478,7 @@ CONTEXT:
 
 USER MESSAGE: {user_question}
 
-Reply like a real person texting: short, to the point, no closing question."""
+Reply now, short, like a real person texting back."""
 
     reply = generate_text(prompt)
 
@@ -491,7 +552,7 @@ def transcribe_audio(audio_bytes, mime_type):
             )
             return response.text.strip()
         except Exception as e:
-            if is_overloaded_error(e) and attempt == 0:
+            if is_transient_error(e) and attempt == 0:
                 time.sleep(8)
                 continue
             print(f"Gemini transcription failed, falling back to Groq: {e}")
@@ -651,523 +712,451 @@ app = FastAPI()
 processed_message_ids = set()
 
 
-# ---------- Storage + Dashboard (SQLite: survives restarts if DB_PATH is on a volume) ----------
-import datetime
-import hashlib
-import hmac
-import re
-import sqlite3
-import threading
-
-from fastapi.responses import JSONResponse
-
-TEAM_HEAD_NAME = os.environ.get("TEAM_HEAD_NAME", "Sir Ihtisham")
-LONG_REPLY_CHARS = 380  # text answers longer than this are sent as a voice note instead
-FOLLOWUP_AFTER_DAYS = 3
-FORWARD_CHECK_AFTER_DAYS = 2
-TEMPLATE_LANG = os.environ.get("TEMPLATE_LANG", "en")
-FOLLOWUP_TEMPLATE = os.environ.get("FOLLOWUP_TEMPLATE", "")  # approved WhatsApp template names
-FORWARD_CHECK_TEMPLATE = os.environ.get("FORWARD_CHECK_TEMPLATE", "")
-
-DB_PATH = os.environ.get("DB_PATH", "agent.db")
-_db = sqlite3.connect(DB_PATH, check_same_thread=False)
-_db.row_factory = sqlite3.Row
-_db_lock = threading.Lock()
-_db.executescript("""
-CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, phone TEXT,
-  direction TEXT, type TEXT, text TEXT);
-CREATE INDEX IF NOT EXISTS idx_msg_phone ON messages(phone);
-CREATE TABLE IF NOT EXISTS leads(phone TEXT PRIMARY KEY, name TEXT DEFAULT '', city TEXT DEFAULT '',
-  course TEXT DEFAULT '', status TEXT DEFAULT 'Follow-up Needed', last_user_ts REAL DEFAULT 0,
-  last_agent_ts REAL DEFAULT 0, followup_sent INTEGER DEFAULT 0, forwarded_at REAL DEFAULT 0,
-  forward_checked INTEGER DEFAULT 0);
-""")
-
-
-def db(sql, args=()):
-    with _db_lock:
-        cur = _db.execute(sql, args)
-        _db.commit()
-        return [dict(r) for r in cur.fetchall()]
-
-
-def log_message(phone, direction, msg_type, text):
-    """direction: 'in' (student) or 'out' (agent)."""
-    now = time.time()
-    db("INSERT INTO messages(time,phone,direction,type,text) VALUES(?,?,?,?,?)",
-       (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), phone, direction, msg_type, text))
-    db("INSERT OR IGNORE INTO leads(phone) VALUES(?)", (phone,))
-    if direction == "in":
-        db("UPDATE leads SET last_user_ts=?, followup_sent=0 WHERE phone=?", (now, phone))
-    else:
-        db("UPDATE leads SET last_agent_ts=? WHERE phone=?", (now, phone))
-
-
-def record_forward_if_needed(phone, reply_text):
-    if TEAM_HEAD_NUMBER in reply_text:
-        db("UPDATE leads SET forwarded_at=? WHERE phone=? AND forwarded_at=0", (time.time(), phone))
-
-
-# Restore short-term memory after a restart so the agent never "forgets" a student
-for _r in db("SELECT DISTINCT phone FROM messages"):
-    for _m in reversed(db("SELECT direction,text FROM messages WHERE phone=? ORDER BY id DESC LIMIT ?",
-                          (_r["phone"], MAX_HISTORY_TURNS * 2))):
-        conversation_history.setdefault(_r["phone"], []).append(
-            ("user" if _m["direction"] == "in" else "assistant", _m["text"]))
-
-
-def lead_info_text(phone):
-    r = db("SELECT name,city FROM leads WHERE phone=?", (phone,)) if phone else []
-    name = (r[0]["name"] if r else "") or "unknown"
-    city = (r[0]["city"] if r else "") or "unknown"
-    return f"KNOWN STUDENT INFO: name = {name}, city = {city}"
-
-
-def voice_version(text):
-    """Text turned into what should be spoken: no links, and never the phone number."""
-    spoken = re.sub(r"https?://\S+", "", text)
-    if TEAM_HEAD_NUMBER in spoken:
-        spoken = spoken.replace(TEAM_HEAD_NUMBER, "")
-        spoken += " Main number abhi text mein share kar rahi hun."
-    return spoken
-
-
-def contact_card():
-    return f"{TEAM_HEAD_NAME} (Team Head)\n{TEAM_HEAD_NUMBER}"
-
-
-async def refresh_lead(phone):
-    """Read the conversation, save name/city/course/status. Runs only while info is
-    missing, or every 3rd student message, to save API quota."""
-    try:
-        row = db("SELECT name,city FROM leads WHERE phone=?", (phone,))[0]
-        n_in = db("SELECT COUNT(*) c FROM messages WHERE phone=? AND direction='in'", (phone,))[0]["c"]
-        if row["name"] and row["city"] and n_in % 3 != 0:
-            return
-        lead = await asyncio.to_thread(extract_lead_info, phone, get_history(phone))
-        clean = lambda v: "" if v in (None, "Not provided", "General inquiry") else str(v)
-        db("UPDATE leads SET name=COALESCE(NULLIF(?,''),name), city=COALESCE(NULLIF(?,''),city),"
-           " course=COALESCE(NULLIF(?,''),course), status=? WHERE phone=?",
-           (clean(lead["name"]), clean(lead["address"]), clean(lead["course_interested"]),
-            lead["status"], phone))
-        await asyncio.to_thread(upsert_student, phone)
-    except Exception as e:
-        print(f"refresh_lead failed for {phone}: {e}")
-
-
-# ---------- Dashboard auth: sign-in page + cookie ----------
-DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "changeme")
-
-
-def _dash_token():
-    return hmac.new(DASHBOARD_PASSWORD.encode(), b"wa-agent-dashboard", hashlib.sha256).hexdigest()
-
-
-def is_authed(request: Request):
-    return hmac.compare_digest(request.cookies.get("wa_dash", ""), _dash_token())
-
-
-def check_dashboard_auth(request: Request):
-    if not is_authed(request):
-        raise HTTPException(status_code=401, detail="Sign in required")
-    return True
-
-
-@app.post("/dashboard/login")
-async def dashboard_login(request: Request):
-    d = await request.json()
-    ok = hmac.compare_digest(str(d.get("user", "")), DASHBOARD_USER) and \
-        hmac.compare_digest(str(d.get("password", "")), DASHBOARD_PASSWORD)
-    if not ok:
-        return JSONResponse({"ok": False}, status_code=401)
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie("wa_dash", _dash_token(), httponly=True, samesite="lax", max_age=7 * 86400)
-    return resp
-
-
-@app.post("/dashboard/logout")
-def dashboard_logout():
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie("wa_dash")
-    return resp
-
-
-VIEW_SQL = {
-    "live": "1=1",
-    "interested": "status='Interested'",
-    "not_interested": "status='Not Interested'",
-    "history": "1=1",
-    "followups": f"status='Interested' AND (followup_sent=1 OR (last_user_ts>0 AND ?-last_user_ts>{FOLLOWUP_AFTER_DAYS}*86400))",
-    "forwarded": "forwarded_at>0",
-}
-
-
-@app.get("/dashboard/api/leads")
-def dashboard_leads(view: str = "live", auth: bool = Depends(check_dashboard_auth)):
-    cond = VIEW_SQL.get(view, "1=1")
-    args = (time.time(),) if "?" in cond else ()
-    rows = db(
-        f"SELECT leads.*, (SELECT text FROM messages m WHERE m.phone=leads.phone ORDER BY id DESC LIMIT 1) AS last_text,"
-        f" MAX(last_user_ts,last_agent_ts) AS last_ts FROM leads WHERE {cond} ORDER BY last_ts DESC LIMIT 300", args)
-    now = time.time()
-    for r in rows:
-        r["live"] = now - r["last_ts"] < 300
-        r["ago_min"] = int((now - r["last_ts"]) / 60) if r["last_ts"] else None
-    return {"leads": rows}
-
-
-@app.get("/dashboard/api/chat")
-def dashboard_chat(phone: str, auth: bool = Depends(check_dashboard_auth)):
-    msgs = db("SELECT time,direction,type,text FROM messages WHERE phone=? ORDER BY id DESC LIMIT 200", (phone,))
-    lead = db("SELECT * FROM leads WHERE phone=?", (phone,))
-    return {"messages": msgs[::-1], "lead": lead[0] if lead else None}
-
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard_page(request: Request):
-    return HTMLResponse(DASHBOARD_HTML if is_authed(request) else LOGIN_HTML)
-
-
-_STYLE = """
-:root{--ink:#0B1F4B;--ink2:#14306E;--sky:#38BDF8;--skyl:#E0F2FE;--bg:#F3F8FD;--line:#D6E4F2}
-*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:#10213f}
-"""
-
-LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>WhatsApp Agent Dashboard</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"><style>""" + _STYLE + """
-body{display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,var(--ink),var(--ink2) 60%,#1d5fa8)}
-form{background:#fff;padding:32px;border-radius:14px;width:min(360px,92vw);display:grid;gap:12px;border-top:5px solid var(--sky)}
-h1{margin:0 0 4px;font-size:22px;color:var(--ink)}input{padding:11px;border:1px solid var(--line);border-radius:8px;font-size:15px}
-button{padding:12px;border:0;border-radius:8px;background:var(--ink);color:#fff;font-size:15px;cursor:pointer}
-button:hover{background:var(--ink2)}#err{color:#b91c1c;font-size:13px;min-height:16px}</style></head><body>
-<form onsubmit="go(event)"><h1>WhatsApp Agent Dashboard</h1><input id="u" placeholder="Username" autocomplete="username">
-<input id="p" type="password" placeholder="Password" autocomplete="current-password"><div id="err"></div><button>Sign in</button></form>
-<script>async function go(e){e.preventDefault();const r=await fetch('/dashboard/login',{method:'POST',headers:{'Content-Type':'application/json'},
-body:JSON.stringify({user:u.value,password:p.value})});if(r.ok)location.reload();else err.textContent='Wrong username or password'}</script></body></html>"""
-
-DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>WhatsApp Agent Dashboard</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"><style>""" + _STYLE + """
-.app{display:grid;grid-template-columns:230px 330px 1fr;height:100vh}
-nav{background:var(--ink);color:#fff;padding:18px 12px;display:flex;flex-direction:column;gap:6px}
-nav h1{font-size:16px;margin:0 8px 14px;line-height:1.3}nav h1 span{color:var(--sky)}
-nav button{background:none;border:0;color:#c7d8f2;text-align:left;padding:11px 12px;border-radius:8px;font-size:14px;cursor:pointer}
-nav button:hover{background:var(--ink2)}nav button.on{background:var(--sky);color:var(--ink);font-weight:600}
-nav .sp{flex:1}.list{background:#fff;border-right:1px solid var(--line);overflow-y:auto}
-.list h2{margin:0;padding:16px;font-size:15px;color:var(--ink);border-bottom:1px solid var(--line);position:sticky;top:0;background:#fff}
-.row{padding:12px 16px;border-bottom:1px solid #edf3fa;cursor:pointer}.row:hover{background:var(--skyl)}.row.on{background:var(--skyl);border-left:4px solid var(--sky)}
-.row b{font-size:14px;color:var(--ink)}.row small{display:block;color:#5b6f8f;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-left:6px}
-.tag{font-size:11px;padding:2px 7px;border-radius:99px;background:var(--skyl);color:var(--ink2);margin-left:6px}
-.chat{display:flex;flex-direction:column;min-width:0}.head{background:#fff;padding:14px 20px;border-bottom:1px solid var(--line)}
-.head b{color:var(--ink);font-size:16px}.head div{font-size:12px;color:#5b6f8f;margin-top:3px}
-.feed{flex:1;overflow-y:auto;padding:18px 22px}.msg{max-width:68%;margin:7px 0;padding:9px 13px;border-radius:12px;font-size:14px;line-height:1.45;white-space:pre-wrap;word-wrap:break-word}
-.msg.in{background:#fff;border:1px solid var(--line)}.msg.out{background:var(--ink);color:#fff;margin-left:auto}
-.msg i{display:block;font-size:10.5px;opacity:.65;font-style:normal;margin-bottom:3px}
-.empty{color:#7a8ca8;text-align:center;margin-top:60px;font-size:14px}
-@media(max-width:900px){.app{grid-template-columns:1fr;height:auto}.list{max-height:40vh}.chat{height:60vh}nav{flex-direction:row;flex-wrap:wrap}nav h1{width:100%}}
-</style></head><body><div class="app"><nav id="nav"></nav><div class="list" id="list"></div>
-<div class="chat"><div class="head" id="head"><b>Pick a chat</b></div><div class="feed" id="feed"><div class="empty">Select a number to read the conversation live.</div></div></div></div>
-<script>
-const VIEWS=[['live','Live Chats'],['interested','Interested Students'],['not_interested','Not Interested'],['history','History'],['followups','Follow-ups'],['forwarded','Forwarded to Team Head']];
-let view='live',phone=null;
-const esc=s=>{const d=document.createElement('div');d.textContent=s??'';return d.innerHTML};
-function nav(){document.getElementById('nav').innerHTML='<h1>WhatsApp Agent <span>Dashboard</span></h1>'+
-VIEWS.map(([k,l])=>`<button class="${k==view?'on':''}" onclick="setView('${k}')">${l}</button>`).join('')+'<div class="sp"></div><button onclick="logout()">Sign out</button>'}
-async function api(u){const r=await fetch(u);if(r.status==401){location.reload();return null}return r.json()}
-function setView(v){view=v;nav();refresh()}
-function pick(p){phone=p;refresh()}
-async function logout(){await fetch('/dashboard/logout',{method:'POST'});location.reload()}
-async function refresh(){
- const d=await api('/dashboard/api/leads?view='+view);if(!d)return;
- const title=VIEWS.find(v=>v[0]==view)[1];
- document.getElementById('list').innerHTML=`<h2>${title} (${d.leads.length})</h2>`+(d.leads.map(l=>`<div class="row ${l.phone==phone?'on':''}" onclick="pick('${esc(l.phone)}')">
- <b>${esc(l.name||l.phone)}</b>${l.live?'<span class="dot"></span>':''}${l.name?`<span class="tag">${esc(l.phone)}</span>`:''}
- <small>${esc(l.last_text)}</small><small>${esc(l.course||'')}${l.city?' · '+esc(l.city):''} ${l.ago_min!=null?' · '+l.ago_min+' min ago':''}</small></div>`).join('')||'<div class="empty">Nothing here yet</div>');
- if(phone){const c=await api('/dashboard/api/chat?phone='+phone);if(!c)return;const L=c.lead||{};
-  document.getElementById('head').innerHTML=`<b>${esc(L.name||phone)}</b><div>${esc(phone)} · ${esc(L.status||'')} ${L.city?'· '+esc(L.city):''} ${L.course?'· '+esc(L.course):''}</div>`;
-  const f=document.getElementById('feed'),atEnd=f.scrollHeight-f.scrollTop-f.clientHeight<80;
-  f.innerHTML=c.messages.map(m=>`<div class="msg ${m.direction}"><i>${m.direction=='in'?'Student':'Agent'} · ${m.type} · ${esc(m.time)}</i>${esc(m.text)}</div>`).join('');
-  if(atEnd)f.scrollTop=f.scrollHeight}}
-nav();refresh();setInterval(refresh,3000);
-</script></body></html>"""
-
-
-@app.get("/webhook")
-def verify_webhook(request: Request):
-    """Meta calls this once, when you save the webhook URL, to confirm you
-    own this server. It must echo back the 'hub.challenge' value."""
-    params = request.query_params
-    mode = params.get("hub.mode")
-    token = params.get("hub.verify_token")
-    challenge = params.get("hub.challenge")
-
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-        return PlainTextResponse(challenge)
-    return PlainTextResponse("Verification failed", status_code=403)
-
-
-@app.post("/webhook")
-async def receive_whatsapp_message(request: Request):
-    """Meta calls this every time a user sends a WhatsApp message."""
-    data = await request.json()
-    try:
-        entry = data["entry"][0]
-        change = entry["changes"][0]["value"]
-        messages = change.get("messages")
-
-        if messages:
-            message = messages[0]
-            message_id = message.get("id")
-            from_number = message["from"]  # sender's WhatsApp number
-            msg_type = message.get("type")
-            print(f"Incoming WhatsApp {msg_type} message from: {from_number}")
-
-            if message_id in processed_message_ids:
-                print(f"Duplicate delivery of message {message_id}, skipping.")
-                return {"status": "duplicate, skipped"}
-            processed_message_ids.add(message_id)
-
-            user_text = None
-            is_voice_message = False
-
-            if msg_type == "text":
-                user_text = message.get("text", {}).get("body", "")
-            elif msg_type == "audio":
-                is_voice_message = True
-                media_id = message["audio"]["id"]
-                try:
-                    audio_bytes, mime_type = download_whatsapp_media(media_id)
-                    user_text = transcribe_audio(audio_bytes, mime_type)
-                    print(f"Transcribed voice message: {user_text}")
-                except Exception as e:
-                    print(f"Voice transcription failed after retries: {e}")
-                    send_whatsapp_message(
-                        from_number,
-                        "Yeh voice note samajhne mein masla ho raha hai. "
-                        "Dobara bhej kar dekh lein, ya text mein likh dein, "
-                        f"ya seedha rabta karein: {TEAM_HEAD_NUMBER}",
-                    )
-                    user_text = None
-
-            if user_text:
-                log_message(
-                    from_number, "in", "voice" if is_voice_message else "text", user_text
-                )
-                reply_text = rag_answer(user_text, user_id=from_number, voice=is_voice_message)
-                log_message(
-                    from_number, "out", "voice" if is_voice_message else "text", reply_text
-                )
-                record_forward_if_needed(from_number, reply_text)
-                asyncio.create_task(refresh_lead(from_number))
-
-                if is_voice_message or len(reply_text) > LONG_REPLY_CHARS:
-                    # Voice in -> voice out; long answers also go as voice
-                    # — feels like a real conversation
-                    voice_sent = False
-                    try:
-                        audio, mime_type, filename = await synthesize_reply_audio(voice_version(reply_text))
-                        voice_sent = send_whatsapp_voice(from_number, audio, mime_type, filename)
-                    except Exception as e:
-                        print(f"Voice reply failed: {e}")
-                    if not voice_sent:
-                        # Never leave the user without an answer
-                        send_whatsapp_message(from_number, reply_text)
-                    elif TEAM_HEAD_NUMBER in reply_text:
-                        send_whatsapp_message(from_number, contact_card())
-                else:
-                    send_whatsapp_message(from_number, reply_text)
-    except Exception as e:
-        print("Error processing incoming WhatsApp message:", e)
-
-    # Always return 200 quickly so Meta doesn't retry/resend the same message
-    return {"status": "received"}
-
-
-# Mount the Gradio chat UI at "/" for browser-based testing, alongside the
-# WhatsApp webhook routes above.
-# ---------- Google Sheet: automatic lead summary every 2 hours ----------
+# ====================== Google Sheets ======================
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
-GOOGLE_SHEET_TAB_NAME = os.environ.get("GOOGLE_SHEET_TAB_NAME", "Leads")
-SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60  # 2 hours
+STUDENTS_TAB = os.environ.get("GOOGLE_SHEET_TAB_NAME", "Students")
+SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
+STUDENT_HEADERS = ["Customer contact #", "Customer Name", "Remarks", "Interested course", "QA Remark",
+                   "City", "Qualification", "Motive", "Status", "Discount Requested", "Head Reply"]
+SUMMARY_HEADERS = ["Time window", "Total numbers", "New", "Returning", "Interested", "Not Interested",
+                   "Fee asked", "Discount requests", "Forwarded to head", "Voice notes received", "Media sent"]
+DETAIL_HEADERS = ["Window end", "Phone", "Name", "Student asked", "Agent replied", "Status"]
+_students = _summary = _details = None
+_row_of = {}
+_sheet_lock = threading.Lock()
 
-_sheet = None
 if GOOGLE_SHEETS_CREDENTIALS_JSON and GOOGLE_SHEET_ID:
     try:
-        import json as _json
-
         import gspread
         from google.oauth2.service_account import Credentials as GoogleCredentials
 
-        _creds_dict = _json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
-        _scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        _gcreds = GoogleCredentials.from_service_account_info(_creds_dict, scopes=_scopes)
-        _gc = gspread.authorize(_gcreds)
-        _spreadsheet = _gc.open_by_key(GOOGLE_SHEET_ID)
-        try:
-            _sheet = _spreadsheet.worksheet(GOOGLE_SHEET_TAB_NAME)
-        except gspread.WorksheetNotFound:
-            _sheet = _spreadsheet.add_worksheet(GOOGLE_SHEET_TAB_NAME, rows=1000, cols=8)
-            _sheet.append_row(
-                ["Timestamp", "Phone Number", "Name", "City/Address", "Course Interested", "Status"]
-            )
-        print("Google Sheet connected for lead summaries.")
+        _gc = gspread.authorize(GoogleCredentials.from_service_account_info(
+            json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]))
+        _ss = _gc.open_by_key(GOOGLE_SHEET_ID)
+
+        def _tab(name, headers):
+            try:
+                return _ss.worksheet(name)
+            except gspread.WorksheetNotFound:
+                ws = _ss.add_worksheet(name, rows=2000, cols=len(headers))
+                ws.append_row(headers)
+                return ws
+
+        _students = _tab(STUDENTS_TAB, STUDENT_HEADERS)
+        _summary = _tab("2 Hour Summary", SUMMARY_HEADERS)
+        _details = _tab("2 Hour Details", DETAIL_HEADERS)
+        _row_of = {v: i + 1 for i, v in enumerate(_students.col_values(1)) if i > 0 and v}
+        print("Google Sheets connected.")
     except Exception as e:
-        print(f"Google Sheet setup failed (summaries will be skipped): {e}")
+        print(f"Google Sheets setup failed (sheets skipped): {e}")
 else:
-    print("GOOGLE_SHEETS_CREDENTIALS_JSON / GOOGLE_SHEET_ID not set — lead summary disabled.")
+    print("Google Sheets env vars not set - sheets disabled.")
 
 
-def extract_lead_info(phone, history):
-    """Ask the AI to read a conversation and pull out structured lead info.
-    Falls back to safe defaults if extraction fails for any reason."""
-    convo_text = format_history(history)
-    prompt = f"""Read this WhatsApp conversation between a potential student and
-Leaders Academia's assistant. Extract the following as STRICT JSON only, no
-other text:
-
-{{
-  "name": "the person's name if they mentioned it, else 'Not provided'",
-  "address": "their city/address if mentioned, else 'Not provided'",
-  "course_interested": "the specific course they showed interest in, else 'General inquiry'",
-  "status": "one of: Interested, Not Interested, Follow-up Needed"
-}}
-
-CONVERSATION:
-{convo_text}
-
-Respond with ONLY the JSON object, nothing else."""
-
-    try:
-        import json as _json
-        import re as _re
-
-        raw = generate_text(prompt)
-        match = _re.search(r"\{.*\}", raw, _re.DOTALL)
-        data = _json.loads(match.group(0)) if match else {}
-        return {
-            "name": data.get("name", "Not provided"),
-            "address": data.get("address", "Not provided"),
-            "course_interested": data.get("course_interested", "General inquiry"),
-            "status": data.get("status", "Follow-up Needed"),
-        }
-    except Exception as e:
-        print(f"Lead extraction failed for {phone}: {e}")
-        return {
-            "name": "Not provided",
-            "address": "Not provided",
-            "course_interested": "General inquiry",
-            "status": "Follow-up Needed",
-        }
-
-
-_last_summary_time = time.time()
-_students_ws = None
-
-
-def get_students_sheet():
-    """Second tab: one live row per student (name, city, status, last message/reply)."""
-    global _students_ws
-    if _students_ws is not None:
-        return _students_ws
-    if not _sheet:
-        return None
-    try:
-        _students_ws = _spreadsheet.worksheet("Students")
-    except gspread.WorksheetNotFound:
-        _students_ws = _spreadsheet.add_worksheet("Students", rows=2000, cols=8)
-        _students_ws.append_row(["Updated", "Phone", "Name", "City", "Course", "Status",
-                                 "Last Student Message", "Last Agent Reply"])
-    return _students_ws
-
-
-def upsert_student(phone):
-    ws = get_students_sheet()
-    if not ws:
+def sync_student_row(phone):
+    """One row per student, updated live. Never touches the 'QA Remark' column (E)."""
+    if not _students:
         return
-    lead = db("SELECT * FROM leads WHERE phone=?", (phone,))[0]
-    last_in = db("SELECT text FROM messages WHERE phone=? AND direction='in' ORDER BY id DESC LIMIT 1", (phone,))
-    last_out = db("SELECT text FROM messages WHERE phone=? AND direction='out' ORDER BY id DESC LIMIT 1", (phone,))
-    row = [datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), phone, lead["name"] or "Not provided",
-           lead["city"] or "Not provided", lead["course"] or "General inquiry", lead["status"],
-           (last_in[0]["text"] if last_in else "")[:300], (last_out[0]["text"] if last_out else "")[:300]]
-    cell = ws.find(str(phone), in_column=2)
-    if cell:
-        ws.update(values=[row], range_name=f"A{cell.row}:H{cell.row}")
-    else:
-        ws.append_row(row)
+    try:
+        p = get_profile(phone)
+        left = [phone, p["name"], p["remarks"], p["course"]]
+        right = [p["city"], p["qualification"], p["motive"], p["status"], "Yes" if p["discount"] else "No"]
+        with _sheet_lock:
+            r = _row_of.get(phone)
+            if not r:
+                res = _students.append_row(left + [""] + right + [""], value_input_option="RAW")
+                m = re.search(r"!A(\d+)", res["updates"]["updatedRange"])
+                r = int(m.group(1))
+                _row_of[phone] = r
+            else:
+                _students.batch_update([{"range": f"A{r}:D{r}", "values": [left]},
+                                        {"range": f"F{r}:J{r}", "values": [right]}],
+                                       value_input_option="RAW")
+            yellow = {"backgroundColor": {"red": 1, "green": 1, "blue": 0}}
+            white = {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}
+            _students.format(f"A{r}:K{r}", yellow if p["status"] == "Not Interested" else white)
+    except Exception as e:
+        print(f"Student sheet sync failed for {phone}: {e}")
 
 
-def send_proactive(phone, name, text, template):
-    """WhatsApp only allows free text within 24h of the student's last message.
-    For 3-day / 2-day follow-ups an APPROVED TEMPLATE is required (set the env var)."""
-    if template:
-        url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-        payload = {"messaging_product": "whatsapp", "to": phone, "type": "template",
-                   "template": {"name": template, "language": {"code": TEMPLATE_LANG},
-                                "components": [{"type": "body", "parameters": [
-                                    {"type": "text", "text": name or "dear student"}]}]}}
-        r = requests.post(url, headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-                                        "Content-Type": "application/json"}, json=payload, timeout=20)
-        if r.status_code != 200:
-            print("Template send failed:", r.status_code, r.text)
-        return r.status_code == 200
-    return send_whatsapp_message(phone, text).status_code == 200
+def extract_and_sync(phone):
+    """Real-time: read the chat, update the student's profile + sheet row."""
+    try:
+        p = get_profile(phone)
+        prompt = f"""Read this WhatsApp chat between a potential student and Leaders Academia's assistant.
+Return STRICT JSON only, no other text:
+{{"name":"","city":"","qualification":"","motive":"","course":"","status":"Interested | Not Interested | Follow-up Needed | Enrolled (pick one)","discount_requested":false,"no_voice":false,"remark":"max 6 words on what happened in the latest messages"}}
+Use "" when unknown. no_voice=true only if the student asked not to get voice messages. Already known: {profile_text(p)}
+
+CHAT:
+{format_history(get_history(phone))}"""
+        raw = generate_text(prompt)
+        d = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+        upd = {k: d[k].strip() for k in ("name", "city", "qualification", "motive", "course")
+               if isinstance(d.get(k), str) and d[k].strip()
+               and d[k].strip().lower() not in ("not provided", "unknown", "none", "n/a")}
+        if d.get("status") in STATUSES:
+            upd["status"] = d["status"]
+        if d.get("discount_requested"):
+            upd["discount"] = 1
+        if d.get("no_voice"):
+            upd["no_voice"] = 1
+        rem = (d.get("remark") or "").strip()
+        if rem and rem not in p["remarks"]:
+            upd["remarks"] = (p["remarks"] + " | " if p["remarks"] else "") + datetime.datetime.now().strftime("%d %b") + " " + rem
+        update_profile(phone, **upd)
+        sync_student_row(phone)
+    except Exception as e:
+        print(f"Profile extraction failed for {phone}: {e}")
 
 
-async def run_periodic_lead_summary():
-    """Every 2 hours: refresh every active student's row in the Students tab and add
-    one summary line (how many numbers were contacted) to the Leads tab."""
-    global _last_summary_time
+def write_summary(start, end):
+    if not _summary:
+        return
+    ph = [r["phone"] for r in db("SELECT DISTINCT phone FROM messages WHERE direction='in' AND time>?", (start,))]
+    if not ph:
+        return
+    first = {r["phone"] for r in db("SELECT phone FROM messages GROUP BY phone HAVING MIN(time)>?", (start,))}
+    st = {s: 0 for s in STATUSES}
+    disc = 0
+    for x in ph:
+        p = get_profile(x)
+        st[p["status"]] = st.get(p["status"], 0) + 1
+        disc += 1 if p["discount"] else 0
+    fee = db("""SELECT COUNT(DISTINCT phone) c FROM messages WHERE direction='in' AND time>? AND
+      (lower(text) LIKE '%fee%' OR lower(text) LIKE '%price%' OR lower(text) LIKE '%kitn%' OR lower(text) LIKE '%cost%')""", (start,))[0]["c"]
+    voice = db("SELECT COUNT(*) c FROM messages WHERE direction='in' AND type='voice' AND time>?", (start,))[0]["c"]
+    fwd = db("SELECT COUNT(*) c FROM profiles WHERE fwd_time>?", (start,))[0]["c"]
+    med = db("SELECT COUNT(*) c FROM media_sent WHERE time>?", (start,))[0]["c"]
+    new_n = len(first & set(ph))
+    _summary.append_row([f"{start} to {end}", len(ph), new_n, len(ph) - new_n, st["Interested"],
+                         st["Not Interested"], fee, disc, fwd, voice, med], value_input_option="RAW")
+    rows = []
+    for x in ph:
+        p = get_profile(x)
+        q = db("SELECT text FROM messages WHERE phone=? AND direction='in' AND time>? ORDER BY id DESC LIMIT 1", (x, start))
+        a = db("SELECT text FROM messages WHERE phone=? AND direction='out' AND time>? ORDER BY id DESC LIMIT 1", (x, start))
+        rows.append([end, x, p["name"], q[0]["text"][:300] if q else "", a[0]["text"][:300] if a else "", p["status"]])
+    _details.append_rows(rows, value_input_option="RAW")
+
+
+async def run_periodic_summary():
+    last = now()
     while True:
         await asyncio.sleep(SUMMARY_INTERVAL_SECONDS)
+        start, last = last, now()
         try:
-            cutoff = _last_summary_time
-            _last_summary_time = time.time()
-            phones = [r["phone"] for r in db(
-                "SELECT phone FROM leads WHERE last_user_ts>? OR last_agent_ts>?", (cutoff, cutoff))]
-            for phone in phones:
-                await refresh_lead(phone)
-                if _sheet:
-                    await asyncio.to_thread(upsert_student, phone)
-            if _sheet and phones:
-                await asyncio.to_thread(_sheet.append_row, [
-                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "SUMMARY",
-                    f"{len(phones)} number(s) chatted in the last 2 hours", "", "", ""])
+            await asyncio.to_thread(write_summary, start, last)
         except Exception as e:
-            print(f"Periodic lead summary failed: {e}")
+            print(f"2-hour summary failed: {e}")
+
+
+# ====================== WhatsApp helpers: media, templates ======================
+ADMIN_ALERT_NUMBER = os.environ.get("ADMIN_ALERT_NUMBER")          # gets a WhatsApp alert on every forward
+WA_FOLLOWUP_TEMPLATE = os.environ.get("WA_FOLLOWUP_TEMPLATE")      # approved Meta template (1 variable: name)
+WA_CHECKIN_TEMPLATE = os.environ.get("WA_CHECKIN_TEMPLATE")        # approved Meta template (1 variable: name)
+WA_TEMPLATE_LANG = os.environ.get("WA_TEMPLATE_LANG", "en")
+WA_URL = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_NUMBER_ID}"
+
+
+def send_whatsapp_image(to_number, data, mime, caption):
+    h = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    up = requests.post(f"{WA_URL}/media", headers=h, timeout=30,
+                       files={"file": ("poster." + mime.split("/")[-1], data, mime)},
+                       data={"messaging_product": "whatsapp", "type": mime}).json()
+    if not up.get("id"):
+        print("Image upload failed:", up)
+        return False
+    r = requests.post(f"{WA_URL}/messages", headers={**h, "Content-Type": "application/json"}, timeout=20,
+                      json={"messaging_product": "whatsapp", "to": to_number, "type": "image",
+                            "image": {"id": up["id"], "caption": caption}})
+    return r.status_code == 200
+
+
+def pick_media(phone, text):
+    t = text.lower()
+    for m in db("SELECT id,title,keywords,mime FROM media"):
+        if any(k.strip() and k.strip().lower() in t for k in m["keywords"].split(",")):
+            if not db("SELECT 1 FROM media_sent WHERE phone=? AND media_id=?", (phone, m["id"])):
+                return m
+    return None
+
+
+def send_template_or_text(to, template, name, text):
+    """Outside WhatsApp's 24-hour window only approved templates are delivered."""
+    if template:
+        r = requests.post(f"{WA_URL}/messages", timeout=20,
+                          headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"},
+                          json={"messaging_product": "whatsapp", "to": to, "type": "template",
+                                "template": {"name": template, "language": {"code": WA_TEMPLATE_LANG},
+                                             "components": [{"type": "body", "parameters": [{"type": "text", "text": name or "there"}]}]}})
+    else:
+        r = send_whatsapp_message(to, text)
+    if r.status_code != 200:
+        print("Follow-up send failed:", r.status_code, r.text)
+    return r.status_code == 200
+
+
+def do_followups():
+    t3 = (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    t2 = (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+    for p in db("SELECT * FROM profiles WHERE status='Interested' AND followup_sent=0 AND fwd_count=0 AND last_in!='' AND last_in<?", (t3,)):
+        n = p["name"] or "there"
+        text = f"Assalamualaikum {n}! Aap ne Leaders Academia ke course mein interest dikhaya tha. Koi sawal ho to bata dein, main madad kar dungi."
+        if send_template_or_text(p["phone"], WA_FOLLOWUP_TEMPLATE, p["name"], text):
+            log_message(p["phone"], "out", "text", text)
+            update_profile(p["phone"], followup_sent=1, remarks=(p["remarks"] + " | " if p["remarks"] else "") + datetime.datetime.now().strftime("%d %b") + " follow-up sent")
+            sync_student_row(p["phone"])
+    for p in db("SELECT * FROM profiles WHERE fwd_count>0 AND checkin_sent=0 AND fwd_time!='' AND fwd_time<?", (t2,)):
+        n = p["name"] or "there"
+        text = f"Assalamualaikum {n}! Kya aap ki {TEAM_HEAD_NAME} se baat ho gayi? Unhon ne kya kaha, bata dijiye."
+        if send_template_or_text(p["phone"], WA_CHECKIN_TEMPLATE, p["name"], text):
+            log_message(p["phone"], "out", "text", text)
+            update_profile(p["phone"], checkin_sent=1, remarks=(p["remarks"] + " | " if p["remarks"] else "") + datetime.datetime.now().strftime("%d %b") + " head check-in sent")
+            sync_student_row(p["phone"])
 
 
 async def run_followups():
-    """Every 30 min: (1) interested student silent for 3 days -> greet + ask;
-    (2) student forwarded to team head -> after 2 days ask if they spoke to him."""
     while True:
         await asyncio.sleep(1800)
         try:
-            now = time.time()
-            for r in db("SELECT phone,name,course FROM leads WHERE status='Interested' AND followup_sent=0"
-                        " AND last_user_ts>0 AND ?-last_user_ts>?", (now, FOLLOWUP_AFTER_DAYS * 86400)):
-                text = (f"Assalam o Alaikum {r['name'] or ''}! Aap ne {r['course'] or 'hamare courses'} mein "
-                        "interest dikhaya tha. Koi sawal reh gaya ho to bata dein, main yahin hun.").replace("  ", " ")
-                if await asyncio.to_thread(send_proactive, r["phone"], r["name"], text, FOLLOWUP_TEMPLATE):
-                    db("UPDATE leads SET followup_sent=1 WHERE phone=?", (r["phone"],))
-                    log_message(r["phone"], "out", "text", text)
-            for r in db("SELECT phone,name FROM leads WHERE forwarded_at>0 AND forward_checked=0"
-                        " AND ?-forwarded_at>?", (now, FORWARD_CHECK_AFTER_DAYS * 86400)):
-                text = (f"Assalam o Alaikum {r['name'] or ''}! {TEAM_HEAD_NAME} se baat ho gayi? "
-                        "Unhon ne kya kaha, aur aap ki enrollment ka kya plan bana?").replace("  ", " ")
-                if await asyncio.to_thread(send_proactive, r["phone"], r["name"], text, FORWARD_CHECK_TEMPLATE):
-                    db("UPDATE leads SET forward_checked=1 WHERE phone=?", (r["phone"],))
-                    log_message(r["phone"], "out", "text", text)
+            await asyncio.to_thread(do_followups)
         except Exception as e:
             print(f"Follow-up job failed: {e}")
 
 
 @app.on_event("startup")
 async def start_background_tasks():
-    asyncio.create_task(run_periodic_lead_summary())
+    asyncio.create_task(run_periodic_summary())
     asyncio.create_task(run_followups())
+
+
+# ====================== WhatsApp webhook ======================
+@app.get("/webhook")
+def verify_webhook(request: Request):
+    q = request.query_params
+    if q.get("hub.mode") == "subscribe" and q.get("hub.verify_token") == WHATSAPP_VERIFY_TOKEN:
+        return PlainTextResponse(q.get("hub.challenge"))
+    return PlainTextResponse("Verification failed", status_code=403)
+
+
+async def handle_user_text(frm, user_text, is_voice):
+    log_message(frm, "in", "voice" if is_voice else "text", user_text)
+    p = get_profile(frm)
+    reply = await asyncio.to_thread(rag_answer, user_text, frm, bool(is_voice and not p["no_voice"]))
+    forwarded = record_forward_if_needed(frm, reply)
+    head = f"{TEAM_HEAD_NAME}: {TEAM_HEAD_NUMBER}"
+    text_reply = reply.replace("[[HEAD]]", head).strip()
+    spoken = reply.replace("[[HEAD]]", "").strip()
+    use_voice = (not p["no_voice"]) and (is_voice or len(spoken) > 450)  # long answers go out as a voice note
+    log_message(frm, "out", "voice" if use_voice else "text", text_reply)
+    sent = False
+    if use_voice:
+        try:
+            audio, mime, fn = await synthesize_reply_audio(spoken)
+            sent = await asyncio.to_thread(send_whatsapp_voice, frm, audio, mime, fn)
+        except Exception as e:
+            print(f"Voice reply failed: {e}")
+        if sent and forwarded:  # number is never spoken, only typed
+            await asyncio.to_thread(send_whatsapp_message, frm, head)
+    if not sent:
+        await asyncio.to_thread(send_whatsapp_message, frm, text_reply)
+    m = await asyncio.to_thread(pick_media, frm, user_text)
+    if m:
+        row = db("SELECT data FROM media WHERE id=?", (m["id"],))[0]
+        if await asyncio.to_thread(send_whatsapp_image, frm, row["data"], m["mime"], m["title"]):
+            db("INSERT INTO media_sent VALUES(?,?,?)", (frm, m["id"], now()), write=True)
+    if forwarded and ADMIN_ALERT_NUMBER:
+        p2 = get_profile(frm)
+        await asyncio.to_thread(send_whatsapp_message, ADMIN_ALERT_NUMBER,
+                                f"Student forwarded: {p2['name'] or 'name unknown'} ({frm}) - {p2['course'] or 'course not set'}. Last message: {user_text[:150]}")
+    asyncio.create_task(asyncio.to_thread(extract_and_sync, frm))
+
+
+@app.post("/webhook")
+async def receive_whatsapp_message(request: Request):
+    data = await request.json()
+    try:
+        messages = data["entry"][0]["changes"][0]["value"].get("messages")
+        if messages:
+            message = messages[0]
+            mid, frm, mtype = message.get("id"), message["from"], message.get("type")
+            if mid in processed_message_ids:
+                return {"status": "duplicate, skipped"}
+            processed_message_ids.add(mid)
+            user_text, is_voice = None, False
+            if mtype == "text":
+                user_text = message.get("text", {}).get("body", "")
+            elif mtype == "audio":
+                is_voice = True
+                try:
+                    audio_bytes, mime = await asyncio.to_thread(download_whatsapp_media, message["audio"]["id"])
+                    user_text = await asyncio.to_thread(transcribe_audio, audio_bytes, mime)
+                except Exception as e:
+                    print(f"Voice transcription failed: {e}")
+                    await asyncio.to_thread(send_whatsapp_message, frm,
+                                            "Yeh voice note samajhne mein masla ho raha hai. Dobara bhej dein ya text mein likh dein.")
+            if user_text:
+                await handle_user_text(frm, user_text, is_voice)
+    except Exception as e:
+        print("Error processing incoming WhatsApp message:", e)
+    return {"status": "received"}
+
+
+# ====================== Dashboard ======================
+from fastapi.responses import JSONResponse, Response
+
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "changeme")
+
+
+def _token():
+    return hmac.new(DASHBOARD_PASSWORD.encode(), b"leaders-dash", hashlib.sha256).hexdigest()
+
+
+def check_auth(request: Request):
+    if not hmac.compare_digest(request.cookies.get("dash", ""), _token()):
+        raise HTTPException(status_code=401, detail="login required")
+    return True
+
+
+@app.post("/dashboard/login")
+async def dash_login(request: Request):
+    d = await request.json()
+    if d.get("user") == DASHBOARD_USER and hmac.compare_digest(str(d.get("password", "")), DASHBOARD_PASSWORD):
+        r = JSONResponse({"ok": True})
+        r.set_cookie("dash", _token(), httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+        return r
+    return JSONResponse({"ok": False}, status_code=401)
+
+
+@app.post("/dashboard/logout")
+async def dash_logout():
+    r = JSONResponse({"ok": True})
+    r.delete_cookie("dash")
+    return r
+
+
+@app.get("/dashboard/api/chats")
+def dash_chats(filter: str = "all", hours: int = 0, auth: bool = Depends(check_auth)):
+    since = (datetime.datetime.now() - datetime.timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S") if hours else ""
+    rows = db("""SELECT * FROM (SELECT p.*,
+      (SELECT time FROM messages m WHERE m.phone=p.phone ORDER BY id DESC LIMIT 1) AS last_time,
+      (SELECT text FROM messages m WHERE m.phone=p.phone ORDER BY id DESC LIMIT 1) AS last_text FROM profiles p)
+      WHERE last_time IS NOT NULL AND (?='all' OR status=?) AND last_time>=? ORDER BY last_time DESC LIMIT 300""",
+              (filter, filter, since))
+    return {"chats": rows}
+
+
+@app.get("/dashboard/api/chat/{phone}")
+def dash_chat(phone: str, auth: bool = Depends(check_auth)):
+    return {"messages": db("SELECT id,time,direction,type,text,good FROM messages WHERE phone=? ORDER BY id", (phone,))}
+
+
+@app.post("/dashboard/api/good/{mid}")
+def dash_good(mid: int, auth: bool = Depends(check_auth)):
+    db("UPDATE messages SET good=1-good WHERE id=?", (mid,), write=True)
+    return {"ok": True}
+
+
+@app.get("/dashboard/api/people")
+def dash_people(kind: str, auth: bool = Depends(check_auth)):
+    t3 = (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    if kind == "fol":
+        rows = db("SELECT phone,name,course,last_in,followup_sent FROM profiles WHERE status='Interested' AND last_in!='' ORDER BY last_in DESC")
+        for r in rows:
+            r["state"] = "Follow-up sent" if r["followup_sent"] else ("Due now" if r["last_in"] < t3 else "Waiting (under 3 days)")
+    else:
+        rows = db("SELECT phone,name,course,fwd_count,fwd_time,checkin_sent FROM profiles WHERE fwd_count>0 ORDER BY fwd_time DESC")
+        for r in rows:
+            r["state"] = "Check-in sent" if r["checkin_sent"] else "Waiting for 2-day check-in"
+    return {"people": rows}
+
+
+@app.get("/dashboard/api/media")
+def dash_media_list(auth: bool = Depends(check_auth)):
+    return {"media": db("SELECT id,title,keywords FROM media ORDER BY id DESC")}
+
+
+@app.post("/dashboard/api/media")
+async def dash_media_add(request: Request, title: str = "", keywords: str = "", auth: bool = Depends(check_auth)):
+    mime = request.headers.get("content-type", "image/jpeg")
+    db("INSERT INTO media(title,keywords,mime,data) VALUES(?,?,?,?)", (title, keywords, mime, await request.body()), write=True)
+    return {"ok": True}
+
+
+@app.delete("/dashboard/api/media/{mid}")
+def dash_media_del(mid: int, auth: bool = Depends(check_auth)):
+    db("DELETE FROM media WHERE id=?", (mid,), write=True)
+    return {"ok": True}
+
+
+@app.get("/dashboard/media/{mid}")
+def dash_media_file(mid: int, auth: bool = Depends(check_auth)):
+    r = db("SELECT mime,data FROM media WHERE id=?", (mid,))
+    return Response(r[0]["data"], media_type=r[0]["mime"]) if r else Response(status_code=404)
+
+
+DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Leaders Academia Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><style>
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,Arial,sans-serif;background:#f4f5f7;color:#1a1a1a}
+#login{height:100vh;display:flex;align-items:center;justify-content:center}
+#login form{background:#fff;padding:28px;border-radius:12px;width:300px;box-shadow:0 2px 12px #0002}
+#login input,.f input{width:100%;padding:10px;margin:6px 0;border:1px solid #d1d5db;border-radius:8px}
+button{cursor:pointer;border:0;border-radius:8px;padding:10px 12px;background:#2563eb;color:#fff}
+#app{display:none;height:100vh}nav{width:190px;background:#111827;padding:12px;display:flex;flex-direction:column;gap:6px}
+nav button{background:transparent;text-align:left;color:#d1d5db}nav button.on{background:#2563eb;color:#fff}
+main{flex:1;display:flex;min-width:0}#list{width:290px;overflow-y:auto;background:#fff;border-right:1px solid #e5e7eb;display:none}
+#pane{flex:1;overflow-y:auto;padding:16px}.c{padding:10px 14px;border-bottom:1px solid #f0f0f0;cursor:pointer}.c.on{background:#eef2ff}
+.m{max-width:72%;margin:8px 0;padding:9px 13px;border-radius:10px;white-space:pre-wrap;font-size:14px}
+.m.in{background:#fff;border:1px solid #e5e7eb}.m.out{background:#2563eb;color:#fff;margin-left:auto}.m small{opacity:.7;display:block}
+.g{cursor:pointer;float:right;margin-left:8px}table{width:100%;border-collapse:collapse;background:#fff}
+td,th{padding:9px;border-bottom:1px solid #eee;text-align:left;font-size:14px}tr.cl{cursor:pointer}.e{color:#9ca3af;text-align:center;margin-top:30px}
+.grid{display:flex;flex-wrap:wrap;gap:12px}.card{background:#fff;padding:10px;border-radius:10px;width:200px}.card img{width:100%;border-radius:6px}
+</style></head><body>
+<div id="login"><form onsubmit="login();return false"><h3>Leaders Academia</h3><input id="u" placeholder="Username">
+<input id="p" type="password" placeholder="Password"><button style="width:100%">Sign in</button><p id="err" style="color:#b91c1c"></p></form></div>
+<div id="app"><nav id="nav"></nav><main><div id="list"></div><div id="pane"></div></main></div>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const VIEWS=[['live','💬 Live Chats'],['int','⭐ Interested'],['not','🚫 Not Interested'],['media','🖼 Media'],['hist','📜 History'],['fol','🔔 Follow-ups'],['fwd','➡️ Forwarded']];
+const FILTER={live:'all',int:'Interested',not:'Not Interested',hist:'all'};let view='live',sel=null,lastSel=null;
+async function api(u,o){const r=await fetch(u,o);if(r.status==401){showLogin();throw new Error('auth')}return r.json()}
+function showLogin(){$('#login').style.display='flex';$('#app').style.display='none'}
+async function login(){const r=await fetch('/dashboard/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:$('#u').value,password:$('#p').value})});
+ if(r.ok){$('#login').style.display='none';$('#app').style.display='flex';init()}else $('#err').textContent='Wrong username or password'}
+function init(){$('#nav').innerHTML=VIEWS.map(([k,l])=>`<button id="b_${k}" onclick="go('${k}')">${l}</button>`).join('')+'<button onclick="logout()">Sign out</button>';go(view)}
+async function logout(){await fetch('/dashboard/logout',{method:'POST'});showLogin()}
+function go(v,p){view=v;if(p)sel=p;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.id==='b_'+v));draw()}
+async function draw(){try{
+ if(view in FILTER){const L=(await api(`/dashboard/api/chats?filter=${encodeURIComponent(FILTER[view])}&hours=${view==='live'?24:0}`)).chats;
+  $('#list').style.display='block';
+  $('#list').innerHTML=L.map(c=>`<div class="c ${c.phone===sel?'on':''}" onclick="go(view,'${esc(c.phone)}')"><b>${esc(c.name||c.phone)}</b> <small>${c.name?esc(c.phone):''}</small><br><small>${esc(c.status)}${c.fwd_count?' · forwarded':''} · ${esc(c.last_time)}</small><br><small>${esc((c.last_text||'').slice(0,55))}</small></div>`).join('')||'<p class="e">No chats</p>';
+  const f=$('#pane');if(!sel){f.innerHTML='<p class="e">Select a chat</p>';return}
+  const M=(await api('/dashboard/api/chat/'+sel)).messages,nb=f.scrollHeight-f.scrollTop-f.clientHeight<90;
+  f.innerHTML=M.map(m=>`<div class="m ${m.direction}"><small>${m.direction==='in'?'Student':'Agent'} · ${m.type} · ${esc(m.time)}${m.direction==='out'?`<span class="g" onclick="good(${m.id})">${m.good?'👍 good example':'👍'}</span>`:''}</small>${esc(m.text)}</div>`).join('');
+  if(nb||lastSel!==sel)f.scrollTop=f.scrollHeight;lastSel=sel;
+ }else if(view==='fol'||view==='fwd'){$('#list').style.display='none';
+  const P=(await api('/dashboard/api/people?kind='+view)).people;
+  $('#pane').innerHTML='<table><tr><th>Number</th><th>Name</th><th>Course</th><th>'+(view==='fol'?'Last message':'Forwarded')+'</th><th>State</th></tr>'+P.map(r=>`<tr class="cl" onclick="go('hist','${esc(r.phone)}')"><td>${esc(r.phone)}</td><td>${esc(r.name)}</td><td>${esc(r.course)}</td><td>${esc(r.last_in||r.fwd_time)}</td><td>${esc(r.state)}</td></tr>`).join('')+'</table>'+(P.length?'':'<p class="e">Nothing here yet</p>');
+ }else if(view==='media'){$('#list').style.display='none';await drawMedia()}
+}catch(e){}}
+async function good(id){await fetch('/dashboard/api/good/'+id,{method:'POST'});draw()}
+async function drawMedia(){const M=(await api('/dashboard/api/media')).media;
+ $('#pane').innerHTML=`<div class="f card" style="width:340px"><b>Add poster</b><input id="mt" placeholder="Caption / title (e.g. AI Automation Course)"><input id="mk" placeholder="Keywords, comma separated (ai automation, ai course)"><input id="mf" type="file" accept="image/*"><button onclick="addMedia()">Upload</button></div><br><div class="grid">`+
+ M.map(m=>`<div class="card"><img src="/dashboard/media/${m.id}"><b>${esc(m.title)}</b><br><small>${esc(m.keywords)}</small><br><button onclick="delMedia(${m.id})" style="background:#b91c1c;margin-top:6px">Delete</button></div>`).join('')+'</div>'}
+async function addMedia(){const f=$('#mf').files[0];if(!f)return;await fetch(`/dashboard/api/media?title=${encodeURIComponent($('#mt').value)}&keywords=${encodeURIComponent($('#mk').value)}`,{method:'POST',headers:{'Content-Type':f.type},body:f});drawMedia()}
+async function delMedia(id){await fetch('/dashboard/api/media/'+id,{method:'DELETE'});drawMedia()}
+setInterval(()=>{if($('#app').style.display==='flex'&&view!=='media')draw()},3000);
+fetch('/dashboard/api/chats').then(r=>{if(r.ok){$('#login').style.display='none';$('#app').style.display='flex';init()}});
+</script></body></html>"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page():
+    return HTMLResponse(DASHBOARD_HTML)
 
 
 app = gr.mount_gradio_app(app, demo, path="/")
