@@ -133,6 +133,33 @@ tr.cl{cursor:pointer}tr.cl:hover td{background:#f8fafc}
 .mc{overflow:hidden}.mc img{width:100%;aspect-ratio:1/1;object-fit:cover;display:block;background:#e5e7eb}
 .mc div{padding:12px}.mc small{color:var(--mute);display:block;margin:3px 0 10px}
 
+.kp{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin-bottom:18px}
+.k{padding:16px 18px;position:relative;overflow:hidden}
+.k small{color:var(--mute);font-size:12px}.k b{display:block;font-size:28px;margin:4px 0 2px;line-height:1.1}
+.k .d{font-size:12px;font-weight:600}.d.ps{color:#15803d}.d.ng{color:#b91c1c}.d.eq{color:var(--mute)}
+.k:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--c,#16a34a)}
+.gr{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px}
+.gr .wide{grid-column:1/-1}
+.cc{padding:16px 18px}.cc h3{margin:0 0 2px;font-size:15px}.cc p{margin:0 0 12px;color:var(--mute);font-size:12px}
+.cc svg.cv{width:100%;height:auto;display:block;overflow:visible}
+.cc svg text{stroke:none}.cc svg.cv text{font-size:10.5px;fill:#64748b}
+.cc svg.cv rect{stroke:none}.cc svg.dn{width:180px;height:180px}
+.lg{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--mute)}
+.lg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}
+.rng{display:flex;gap:6px;margin-bottom:16px;align-items:center}
+.rng button{background:#fff;border:1px solid var(--line);border-radius:20px;padding:6px 16px;color:var(--mute)}
+.rng button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+.hb{display:flex;align-items:center;gap:10px;margin:9px 0;font-size:13px}
+.hb span.n{width:130px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hb .bar{flex:1;background:#eef2f7;border-radius:6px;height:12px;overflow:hidden}
+.hb .bar i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,var(--brand2),var(--brand))}
+.hb b{width:34px;text-align:right}
+.dn-wrap{display:flex;align-items:center;gap:22px;flex-wrap:wrap}
+.dn-wrap .lg{flex-direction:column;gap:8px;margin:0;font-size:13px;color:var(--ink)}
+.sh{padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.sh .dot{width:12px;height:12px;border-radius:50%;flex:none}
+.sh .tx{flex:1;min-width:240px;font-size:13px}.sh .tx b{font-size:14px}
+.sh .er{color:#b91c1c;font-size:12.5px;margin-top:3px;word-break:break-word}.sh .ok{color:var(--mute);font-size:12.5px;margin-top:3px}
 #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;padding:10px 18px;border-radius:30px;font-size:13px;opacity:0;pointer-events:none;transition:.25s}
 #toast.s{opacity:1}
 
@@ -171,6 +198,8 @@ tr.cl{cursor:pointer}tr.cl:hover td{background:#f8fafc}
 <div id="app">
   <aside>
     <div class="logo"><i>L</i><div><b>Leaders Academia</b><small>WhatsApp Admissions Agent</small></div></div>
+    <div class="sec">Overview</div>
+    <div id="nav0"></div>
     <div class="sec">Conversations</div>
     <div id="nav1"></div>
     <div class="sec">Manage</div>
@@ -211,9 +240,11 @@ const IC={
  fwd:'<svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/></svg>',
  mic:'<svg viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/></svg>',
  info:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>',
+ chart:'<svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-6"/></svg>',
  back:'<svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>'
 };
 const VIEWS={
+ analytics:{t:'Dashboard',s:'Daily analytics and Google Sheet status',i:'chart',g:0},
  live:{t:'Live Chats',s:'Conversations from the last 24 hours',i:'chat',g:1,chat:1,src:'live'},
  int:{t:'Interested',s:'Students who showed interest in a course',i:'star',g:1,chat:1,f:'Interested'},
  not:{t:'Not Interested',s:'Students who declined or are not interested',i:'ban',g:1,chat:1,f:'Not Interested'},
@@ -222,7 +253,7 @@ const VIEWS={
  fwd:{t:'Forwarded',s:'Students handed over to the team head',i:'fwd',g:2,people:1},
  media:{t:'Media',s:'Posters the agent sends when a course is mentioned',i:'img',g:2}
 };
-let view='live',sel=null,ALL=[],LIVE=[],MSGS=[],sig='',lastSel=null,busy=false;
+let view='analytics',sel=null,ALL=[],LIVE=[],MSGS=[],sig='',lastSel=null,busy=false;
 
 /* ---------- time helpers (server time is UTC; shown in your local time) ---------- */
 const pt=s=>{if(!s)return null;const d=new Date(String(s).replace(' ','T')+'Z');return isNaN(d)?null:d};
@@ -256,7 +287,7 @@ async function logout(){await fetch('/dashboard/logout',{method:'POST'});showLog
 /* ---------- shell ---------- */
 function init(){
  const mk=g=>Object.entries(VIEWS).filter(([k,v])=>v.g===g).map(([k,v])=>`<button class="nb" id="b_${k}" onclick="go('${k}')">${IC[v.i]}<span>${v.t}</span><em class="bd" id="n_${k}" style="font-style:normal;display:none"></em></button>`).join('');
- $('#nav1').innerHTML=mk(1);$('#nav2').innerHTML=mk(2);go(view)}
+ $('#nav0').innerHTML=mk(0);$('#nav1').innerHTML=mk(1);$('#nav2').innerHTML=mk(2);go(view)}
 function go(v,p){
  view=v;if(p!==undefined)sel=p;if(!p&&!VIEWS[v].chat)sel=sel;
  document.querySelectorAll('.nb').forEach(b=>b.classList.toggle('on',b.id==='b_'+v));
@@ -276,7 +307,7 @@ function badges(){
  set('not',ALL.filter(x=>x.status==='Not Interested').length);set('hist',ALL.length)}
 function chips(){
  const n=s=>ALL.filter(x=>x.status===s).length;
- $('#chips').innerHTML=VIEWS[view].chat||VIEWS[view].people?
+ $('#chips').innerHTML=VIEWS[view].chat||VIEWS[view].people||view==='analytics'?
  `<div class="chip"><b>${ALL.length}</b><span>Total chats</span></div>
   <div class="chip g"><b>${n('Interested')}</b><span>Interested</span></div>
   <div class="chip r"><b>${n('Not Interested')}</b><span>Not interested</span></div>
@@ -296,6 +327,7 @@ async function refresh(force){
   if(V.chat){await drawChats(force)}
   else if(V.people){await drawPeople()}
   else if(view==='media'){if(force||!$('#mt'))await drawMedia()}
+  else if(view==='analytics'){if(force||Date.now()-anT>30000)await drawAnalytics()}
  }catch(e){}
  busy=false}
 
@@ -372,6 +404,114 @@ async function addMedia(){
  await fetch(`/dashboard/api/media?title=${encodeURIComponent($('#mt').value)}&keywords=${encodeURIComponent($('#mk').value)}`,{method:'POST',headers:{'Content-Type':file.type},body:file});
  toast('Poster uploaded');drawMedia()}
 async function delMedia(id){if(!confirm('Delete this poster?'))return;await fetch('/dashboard/api/media/'+id,{method:'DELETE'});drawMedia()}
+
+
+/* ---------- analytics ---------- */
+let anDays=14,anT=0,AN=null;
+const SC={'Interested':'#16a34a','Not Interested':'#ef4444','Follow-up Needed':'#f59e0b','Enrolled':'#3b82f6'};
+const dl=s=>new Date(s+'T00:00:00').toLocaleDateString([], {day:'numeric',month:'short'});
+const sum=a=>a.reduce((x,y)=>x+y,0);
+function niceMax(v){const s=v/4;if(s<=1)return 4;const p=Math.pow(10,Math.floor(Math.log10(s))),n=s/p;return (n<=1?1:n<=2?2:n<=5?5:10)*p*4}
+function axes(W,H,L,B,max,labels,step){
+ let o='';for(let i=0;i<=4;i++){const y=H-B-(H-B-10)*i/4;
+  o+=`<line x1="${L}" x2="${W}" y1="${y}" y2="${y}" stroke="#e8edf3"/><text x="${L-6}" y="${y+3}" text-anchor="end">${+(max*i/4).toFixed(1)}</text>`}
+ const bw=(W-L)/labels.length;
+ labels.forEach((t,i)=>{if(i%step===0)o+=`<text x="${L+bw*i+bw/2}" y="${H-6}" text-anchor="middle">${t}</text>`});return o}
+function columns(labels,series,o={}){
+ const W=700,H=o.H||250,L=34,B=24,n=labels.length,bw=(W-L)/n,step=Math.ceil(n/(o.maxLabels||10));
+ const tot=labels.map((_,i)=>o.stack?sum(series.map(s=>s.data[i])):Math.max(...series.map(s=>s.data[i])));
+ const max=niceMax(Math.max(1,...tot));let g=axes(W,H,L,B,max,o.lab||labels.map(dl),step);
+ labels.forEach((lb,i)=>{let y0=H-B;const k=series.length,w=o.stack?bw*.62:bw*.7/k;
+  series.forEach((s,j)=>{const v=s.data[i],hh=(H-B-10)*v/max;
+   const x=o.stack?L+bw*i+(bw-w)/2:L+bw*i+bw*.15+w*j;
+   if(o.stack)y0-=hh;
+   const y=o.stack?y0:H-B-hh;
+   g+=`<rect x="${x}" y="${y}" width="${w}" height="${Math.max(hh,0)}" rx="3" fill="${s.color}"><title>${o.lab?o.lab[i]:dl(lb)} · ${s.name}: ${v}</title></rect>`})});
+ return `<svg class="cv" viewBox="0 0 ${W} ${H}">${g}</svg>`}
+function lines(labels,series,H=250){
+ const W=700,L=34,B=24,n=labels.length,bw=(W-L)/n,step=Math.ceil(n/10);
+ const max=niceMax(Math.max(1,...series.flatMap(s=>s.data)));let g=axes(W,H,L,B,max,labels.map(dl),step);
+ series.forEach((s,k)=>{const pts=s.data.map((v,i)=>[L+bw*i+bw/2,H-B-(H-B-10)*v/max]);
+  const d=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ');
+  if(s.area)g+=`<path d="${d} L${pts[pts.length-1][0]} ${H-B} L${pts[0][0]} ${H-B} Z" fill="${s.color}" opacity=".12"/>`;
+  g+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>`;
+  pts.forEach((p,i)=>g+=`<circle cx="${p[0]}" cy="${p[1]}" r="3.6" fill="#fff" stroke="${s.color}" stroke-width="2"><title>${dl(labels[i])} · ${s.name}: ${s.data[i]}</title></circle>`)});
+ return `<svg class="cv" viewBox="0 0 ${W} ${H}">${g}</svg>`}
+function donut(map){
+ const ent=Object.entries(map).filter(([k,v])=>v>0),t=sum(ent.map(e=>e[1]));
+ if(!t)return '<div class="e" style="padding:30px">No data yet</div>';
+ const R=70,C=2*Math.PI*R;let off=0,arcs='';
+ ent.forEach(([k,v])=>{const l=C*v/t;arcs+=`<circle r="${R}" cx="90" cy="90" fill="none" stroke="${SC[k]||'#94a3b8'}" stroke-width="26" stroke-dasharray="${l} ${C-l}" stroke-dashoffset="${-off}" transform="rotate(-90 90 90)"><title>${k}: ${v}</title></circle>`;off+=l});
+ return `<div class="dn-wrap"><svg class="dn" viewBox="0 0 180 180">${arcs}<text x="90" y="88" text-anchor="middle" style="font-size:28px;font-weight:700;fill:#0f172a">${t}</text><text x="90" y="108" text-anchor="middle" style="font-size:11px;fill:#64748b">students</text></svg>
+  <div class="lg">${ent.map(([k,v])=>`<div><i style="background:${SC[k]||'#94a3b8'}"></i>${esc(k)} · <b>${v}</b> (${Math.round(v*100/t)}%)</div>`).join('')}</div></div>`}
+function hbars(list){
+ if(!list.length)return '<div class="e" style="padding:30px">No data yet</div>';
+ const m=Math.max(...list.map(x=>x[1]));
+ return list.map(([n,v])=>`<div class="hb"><span class="n" title="${esc(n)}">${esc(n)}</span><div class="bar"><i style="width:${Math.max(6,v*100/m)}%"></i></div><b>${v}</b></div>`).join('')}
+function delta(a,b){if(a===b)return '<span class="d eq">same as yesterday</span>';
+ const up=a>b,p=b?Math.round(Math.abs(a-b)*100/b)+'%':'new';return `<span class="d ${up?'ps':'ng'}">${up?'▲':'▼'} ${p} vs yesterday</span>`}
+function kpi(t,v,a,b,c){return `<div class="card k" style="--c:${c}"><small>${t}</small><b>${v}</b>${delta(a,b)}</div>`}
+
+async function drawAnalytics(){
+ const d=await api(`/dashboard/api/analytics?days=${anDays}&tz=${-new Date().getTimezoneOffset()}`);AN=d;anT=Date.now();
+ const n=d.labels.length,L=d.labels,td=n-1,yd=n-2;
+ const newTot=L.map((_,i)=>sum(Object.values(d.new_by_status).map(a=>a[i])));
+ const S=d.status,tot=sum(Object.values(S)),good=(S['Interested']||0)+(S['Enrolled']||0);
+ const hrs=d.hours.map((v,i)=>v),hl=hrs.map((_,i)=>String(i).padStart(2,'0')+':00');
+ const peak=hrs.indexOf(Math.max(...hrs));
+ $('#pane').innerHTML=`
+ <div class="rng">${[7,14,30].map(x=>`<button class="${x===anDays?'on':''}" onclick="anDays=${x};drawAnalytics()">Last ${x} days</button>`).join('')}
+  <span style="margin-left:auto;color:var(--mute);font-size:12px">Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · times in your local timezone</span></div>
+ <div class="card sh" id="sheetcard"></div>
+ <div class="kp">
+  ${kpi('Messages from students today',d.msg_in[td],d.msg_in[td],d.msg_in[yd]??0,'#0ea5e9')}
+  ${kpi('Active students today',d.active[td],d.active[td],d.active[yd]??0,'#16a34a')}
+  ${kpi('New students today',newTot[td],newTot[td],newTot[yd]??0,'#8b5cf6')}
+  ${kpi('Forwarded to head today',d.fwd[td],d.fwd[td],d.fwd[yd]??0,'#f59e0b')}
+  <div class="card k" style="--c:#16a34a"><small>Interest rate (all time)</small><b>${tot?Math.round(good*100/tot):0}%</b><span class="d eq">${good} of ${tot} students interested / enrolled</span></div>
+  <div class="card k" style="--c:#475569"><small>All-time totals</small><b>${d.totals.students}</b><span class="d eq">${d.totals.messages} messages · ${d.totals.forwarded} forwarded</span></div>
+ </div>
+ <div class="gr">
+  <div class="card cc wide"><h3>Daily conversation volume</h3><p>Messages received from students vs. replies sent by the counselor</p>
+   ${lines(L,[{name:'Student messages',color:'#0ea5e9',data:d.msg_in,area:1},{name:'Counselor replies',color:'#16a34a',data:d.msg_out}],200)}
+   <div class="lg"><span><i style="background:#0ea5e9"></i>Student messages (${sum(d.msg_in)})</span><span><i style="background:#16a34a"></i>Counselor replies (${sum(d.msg_out)})</span></div></div>
+  <div class="card cc"><h3>New students per day</h3><p>First-time contacts, colored by their current status</p>
+   ${columns(L,Object.keys(d.new_by_status).map(k=>({name:k,color:SC[k],data:d.new_by_status[k]})),{stack:1})}
+   <div class="lg">${Object.keys(SC).map(k=>`<span><i style="background:${SC[k]}"></i>${k}</span>`).join('')}</div></div>
+  <div class="card cc"><h3>Active students per day</h3><p>Unique students who wrote to us each day</p>
+   ${columns(L,[{name:'Active students',color:'#4f46e5',data:d.active}])}</div>
+  <div class="card cc"><h3>Student status</h3><p>Where every conversation stands right now</p>${donut(S)}</div>
+  <div class="card cc"><h3>Most requested courses</h3><p>Interested course captured from chats</p>${hbars(d.courses)}</div>
+  <div class="card cc wide"><h3>Peak hours</h3><p>When students message the most${sum(hrs)?` · busiest around <b>${hl[peak]}</b>`:''}</p>
+   ${columns(hl.map(String),[{name:'Messages',color:'#0ea5e9',data:hrs}],{lab:hl,maxLabels:12,H:200})}</div>
+  <div class="card cc"><h3>Handoffs &amp; posters</h3><p>Forwarded to team head and posters sent per day</p>
+   ${columns(L,[{name:'Forwarded',color:'#8b5cf6',data:d.fwd},{name:'Posters sent',color:'#f59e0b',data:d.media}])}
+   <div class="lg"><span><i style="background:#8b5cf6"></i>Forwarded (${sum(d.fwd)})</span><span><i style="background:#f59e0b"></i>Posters sent (${sum(d.media)})</span></div></div>
+  <div class="card cc"><h3>Voice notes &amp; cities</h3><p>Voice messages received per day · top cities</p>
+   ${columns(L,[{name:'Voice notes',color:'#e11d48',data:d.voice}])}
+   <div style="margin-top:14px">${hbars(d.cities)}</div></div>
+ </div>`;loadSheet()}
+
+/* ---------- google sheet status ---------- */
+async function loadSheet(){
+ const el=$('#sheetcard');if(!el)return null;
+ let st;try{st=await api('/dashboard/api/sheet')}catch(e){return null}
+ const c=st.connected;
+ el.innerHTML=`<span class="dot" style="background:${c?'#22c55e':'#ef4444'}"></span>
+  <div class="tx"><b>Google Sheet · ${c?'Connected':'Not connected'}${c?` · tab "${esc(st.tab)}"`:''}</b>
+  ${st.error?`<div class="er">${esc(st.error)}</div>`:''}
+  ${!c&&st.email?`<div class="ok">Share your sheet with <b>${esc(st.email)}</b> as Editor.</div>`:''}
+  ${c?`<div class="ok">${st.last_ok?'Last successful update: '+full(st.last_ok):'No update written since the last restart'} · ${st.rows} students in sheet</div>`:''}
+  ${st.last_error?`<div class="er">Last error: ${esc(st.last_error)}</div>`:''}
+  ${st.syncing?`<div class="ok">Syncing students… ${esc(st.syncing)}</div>`:''}</div>
+  <button class="btn" ${(!c||st.syncing)?'disabled style="opacity:.5;cursor:default"':''} onclick="syncSheet()">Sync all students now</button>`;
+ return st}
+async function syncSheet(){
+ const r=await api('/dashboard/api/sheet/sync',{method:'POST'});
+ if(!r.ok){toast(r.error||'Could not start');return}
+ toast(r.started?'Sync started':'Already syncing');
+ for(let i=0;i<150;i++){const st=await loadSheet();if(!st||!st.syncing)break;await new Promise(x=>setTimeout(x,3000))}
+ loadSheet()}
 
 /* ---------- events ---------- */
 document.addEventListener('click',async e=>{
