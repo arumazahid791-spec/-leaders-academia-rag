@@ -299,7 +299,7 @@ def rag_answer(user_question, user_id=None, voice=False):
 VOICE RULE: This reply will be spoken aloud as a voice note by a FEMALE
 voice — write it the way she would naturally say it out loud to a person
 sitting in front of her, not like a written announcement. Keep it short
-(2-3 sentences). No lists, no bullet points, no emojis, no symbols — nothing
+(2-3 sentences). No lists, no bullet points, no symbols — nothing
 that only makes sense in writing. Avoid stiff, formal, or "literary" Urdu
 words (no heavy/classical vocabulary) — use the same everyday, casual Urdu
 words a real person uses when talking, the way friends or colleagues
@@ -363,6 +363,13 @@ When someone asks about a course in general, describe what it teaches and
 the real career/practical benefit it gives them — nothing about money at
 all. If they then separately ask about price, give it briefly and factually,
 without repeating the whole course description again.
+
+LEAD CAPTURE RULE: Once someone shows real interest (they ask about
+enrollment, fees, payment, or say they want to join), naturally ask for
+their name and city — phrase it as something that's genuinely needed to
+help them (e.g. "enrollment ke liye aapka naam aur city bata dein"), not
+as a form. Only ask once per conversation, don't repeat this request if
+they already gave this information earlier in CONVERSATION SO FAR.
 
 LEADERS ACADEMIA RULE: For questions about courses, instructors, pricing,
 schedules or the platform, answer using the CONTEXT below as if it's simply
@@ -632,6 +639,18 @@ import datetime
 message_log = []  # flat, newest-last list of every in/out message, for the dashboard
 MAX_LOG_SIZE = 500  # keep memory bounded
 
+# Tracks every phone number that got forwarded to the supervisor (any reply
+# that included the team head's number), with how many times and when.
+forwarded_to_supervisor = {}  # phone -> {"count": int, "last_time": str}
+
+
+def record_forward_if_needed(phone, reply_text):
+    if TEAM_HEAD_NUMBER not in reply_text:
+        return
+    entry = forwarded_to_supervisor.setdefault(phone, {"count": 0, "last_time": ""})
+    entry["count"] += 1
+    entry["last_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def log_message(phone, direction, msg_type, text):
     """direction: 'in' (from a user) or 'out' (from the agent)."""
@@ -683,6 +702,7 @@ DASHBOARD_HTML = """
     .convo.active { background: #eef2ff; }
     .convo .phone { font-weight: 600; font-size: 14px; }
     .convo .meta { font-size: 12px; color: #6b7280; margin-top: 2px; }
+    .badge-forwarded { display: inline-block; margin-top: 4px; font-size: 11px; background: #fef3c7; color: #92400e; padding: 2px 6px; border-radius: 4px; }
     .msg { max-width: 70%; margin: 8px 0; padding: 10px 14px; border-radius: 10px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; }
     .msg.in { background: white; border: 1px solid #e5e7eb; }
     .msg.out { background: #2563eb; color: white; margin-left: auto; }
@@ -706,21 +726,24 @@ DASHBOARD_HTML = """
     let selectedPhone = null;
 
     async function refresh() {
-      const [convoRes, actRes] = await Promise.all([
+      const [convoRes, actRes, fwdRes] = await Promise.all([
         fetch('/dashboard/api/conversations').then(r => r.json()),
         fetch('/dashboard/api/activity?limit=500').then(r => r.json()),
+        fetch('/dashboard/api/forwarded').then(r => r.json()),
       ]);
 
       const convos = convoRes.conversations;
       document.getElementById('stats').innerHTML =
         `<div><b>${convos.length}</b>Active conversations</div>` +
-        `<div><b>${actRes.messages.length}</b>Messages logged (recent)</div>`;
+        `<div><b>${actRes.messages.length}</b>Messages logged (recent)</div>` +
+        `<div><b>${fwdRes.total_forwarded_numbers}</b>Forwarded to supervisor</div>`;
 
       const listEl = document.getElementById('convoList');
       listEl.innerHTML = convos.map(c => `
         <div class="convo ${c.phone === selectedPhone ? 'active' : ''}" onclick="selectConvo('${c.phone}')">
           <div class="phone">${c.phone}</div>
           <div class="meta">${c.message_count} messages · ${c.last_time || ''}</div>
+          ${c.forwarded ? `<span class="badge-forwarded">Forwarded ×${c.forwarded}</span>` : ''}
         </div>
       `).join('') || '<div class="empty">No conversations yet</div>';
 
@@ -781,13 +804,25 @@ def dashboard_conversations(auth: bool = Depends(check_dashboard_auth)):
     for phone, history in conversation_history.items():
         phone_messages = [m for m in message_log if m["phone"] == phone]
         last_time = phone_messages[-1]["time"] if phone_messages else ""
+        forward_info = forwarded_to_supervisor.get(phone)
         convos.append({
             "phone": phone,
             "message_count": len(phone_messages),
             "last_time": last_time,
+            "forwarded": forward_info["count"] if forward_info else 0,
         })
     convos.sort(key=lambda c: c["last_time"], reverse=True)
     return {"conversations": convos}
+
+
+@app.get("/dashboard/api/forwarded")
+def dashboard_forwarded(auth: bool = Depends(check_dashboard_auth)):
+    rows = [
+        {"phone": phone, "count": info["count"], "last_time": info["last_time"]}
+        for phone, info in forwarded_to_supervisor.items()
+    ]
+    rows.sort(key=lambda r: r["last_time"], reverse=True)
+    return {"total_forwarded_numbers": len(rows), "forwarded": rows}
 
 
 @app.get("/webhook")
@@ -855,6 +890,7 @@ async def receive_whatsapp_message(request: Request):
                 log_message(
                     from_number, "out", "voice" if is_voice_message else "text", reply_text
                 )
+                record_forward_if_needed(from_number, reply_text)
 
                 if is_voice_message:
                     # Voice in, voice out — feels like a real conversation
@@ -878,6 +914,120 @@ async def receive_whatsapp_message(request: Request):
 
 # Mount the Gradio chat UI at "/" for browser-based testing, alongside the
 # WhatsApp webhook routes above.
+# ---------- Google Sheet: automatic lead summary every 2 hours ----------
+GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+GOOGLE_SHEET_TAB_NAME = os.environ.get("GOOGLE_SHEET_TAB_NAME", "Leads")
+SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60  # 2 hours
+
+_sheet = None
+if GOOGLE_SHEETS_CREDENTIALS_JSON and GOOGLE_SHEET_ID:
+    try:
+        import json as _json
+
+        import gspread
+        from google.oauth2.service_account import Credentials as GoogleCredentials
+
+        _creds_dict = _json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+        _scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        _gcreds = GoogleCredentials.from_service_account_info(_creds_dict, scopes=_scopes)
+        _gc = gspread.authorize(_gcreds)
+        _spreadsheet = _gc.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            _sheet = _spreadsheet.worksheet(GOOGLE_SHEET_TAB_NAME)
+        except gspread.WorksheetNotFound:
+            _sheet = _spreadsheet.add_worksheet(GOOGLE_SHEET_TAB_NAME, rows=1000, cols=8)
+            _sheet.append_row(
+                ["Timestamp", "Phone Number", "Name", "City/Address", "Course Interested", "Status"]
+            )
+        print("Google Sheet connected for lead summaries.")
+    except Exception as e:
+        print(f"Google Sheet setup failed (summaries will be skipped): {e}")
+else:
+    print("GOOGLE_SHEETS_CREDENTIALS_JSON / GOOGLE_SHEET_ID not set — lead summary disabled.")
+
+
+def extract_lead_info(phone, history):
+    """Ask the AI to read a conversation and pull out structured lead info.
+    Falls back to safe defaults if extraction fails for any reason."""
+    convo_text = format_history(history)
+    prompt = f"""Read this WhatsApp conversation between a potential student and
+Leaders Academia's assistant. Extract the following as STRICT JSON only, no
+other text:
+
+{{
+  "name": "the person's name if they mentioned it, else 'Not provided'",
+  "address": "their city/address if mentioned, else 'Not provided'",
+  "course_interested": "the specific course they showed interest in, else 'General inquiry'",
+  "status": "one of: Interested, Not Interested, Follow-up Needed"
+}}
+
+CONVERSATION:
+{convo_text}
+
+Respond with ONLY the JSON object, nothing else."""
+
+    try:
+        import json as _json
+        import re as _re
+
+        raw = generate_text(prompt)
+        match = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        data = _json.loads(match.group(0)) if match else {}
+        return {
+            "name": data.get("name", "Not provided"),
+            "address": data.get("address", "Not provided"),
+            "course_interested": data.get("course_interested", "General inquiry"),
+            "status": data.get("status", "Follow-up Needed"),
+        }
+    except Exception as e:
+        print(f"Lead extraction failed for {phone}: {e}")
+        return {
+            "name": "Not provided",
+            "address": "Not provided",
+            "course_interested": "General inquiry",
+            "status": "Follow-up Needed",
+        }
+
+
+_last_summary_time = time.time()
+
+
+async def run_periodic_lead_summary():
+    """Every 2 hours, summarize any conversation that had new activity since
+    the last run, and append one row per lead to the Google Sheet."""
+    global _last_summary_time
+    while True:
+        await asyncio.sleep(SUMMARY_INTERVAL_SECONDS)
+        if not _sheet:
+            continue
+        try:
+            cutoff = _last_summary_time
+            active_phones = {
+                m["phone"] for m in message_log
+                if datetime.datetime.strptime(m["time"], "%Y-%m-%d %H:%M:%S").timestamp() > cutoff
+            }
+            print(f"Running lead summary for {len(active_phones)} active conversation(s)...")
+            for phone in active_phones:
+                history = get_history(phone)
+                if not history:
+                    continue
+                lead = await asyncio.to_thread(extract_lead_info, phone, history)
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _sheet.append_row([
+                    timestamp, phone, lead["name"], lead["address"],
+                    lead["course_interested"], lead["status"],
+                ])
+            _last_summary_time = time.time()
+        except Exception as e:
+            print(f"Periodic lead summary failed: {e}")
+
+
+@app.on_event("startup")
+async def start_background_tasks():
+    asyncio.create_task(run_periodic_lead_summary())
+
+
 app = gr.mount_gradio_app(app, demo, path="/")
 
 if __name__ == "__main__":
