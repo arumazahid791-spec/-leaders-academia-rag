@@ -729,12 +729,17 @@ DETAIL_HEADERS = ["Window end", "Phone", "Name", "Student asked", "Agent replied
 _students = _summary = _details = None
 _row_of = {}
 _manual_rows = set()
+_sheet_state = {"connected": False, "error": "", "last_ok": "", "last_error": "", "tab": "", "email": "", "syncing": ""}
 _sheet_lock = threading.Lock()
 
 if GOOGLE_SHEETS_CREDENTIALS_JSON and GOOGLE_SHEET_ID:
     try:
         import gspread
         from google.oauth2.service_account import Credentials as GoogleCredentials
+        try:
+            _sheet_state["email"] = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON).get("client_email", "")
+        except Exception:
+            pass
 
         _gc = gspread.authorize(GoogleCredentials.from_service_account_info(
             json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON),
@@ -776,10 +781,14 @@ if GOOGLE_SHEETS_CREDENTIALS_JSON and GOOGLE_SHEET_ID:
         _colA = _students.col_values(1)
         _row_of = {_norm_phone(v): i + 1 for i, v in enumerate(_students.col_values(2)) if i > 0 and v}
         _manual_rows = {i + 1 for i, v in enumerate(_colA) if i > 0 and v.strip() and v.strip() != AGENT_NAME}
+        _sheet_state.update(connected=True, tab=STUDENTS_TAB, error="")
         print("Google Sheets connected.")
     except Exception as e:
+        _sheet_state["error"] = f"{type(e).__name__}: {e}"[:300] or "unknown error"
         print(f"Google Sheets setup failed (sheets skipped): {e}")
 else:
+    _missing = [n for n, v in (("GOOGLE_SHEETS_CREDENTIALS_JSON", GOOGLE_SHEETS_CREDENTIALS_JSON), ("GOOGLE_SHEET_ID", GOOGLE_SHEET_ID)) if not v]
+    _sheet_state["error"] = "Railway variable(s) missing: " + ", ".join(_missing)
     print("Google Sheets env vars not set - sheets disabled.")
 
 
@@ -836,7 +845,9 @@ def sync_student_row(phone):
             yellow = {"backgroundColor": {"red": 1, "green": 1, "blue": 0}}
             white = {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}
             _students.format(f"A{r}:L{r}", yellow if p["status"] == "Not Interested" else white)
+        _sheet_state["last_ok"] = now()
     except Exception as e:
+        _sheet_state["last_error"] = f"{now()} UTC - {type(e).__name__}: {e}"[:300]
         print(f"Student sheet sync failed for {phone}: {e}")
 
 
@@ -1204,6 +1215,32 @@ def dash_analytics(days: int = 14, tz: int = 0, auth: bool = Depends(check_auth)
                        "messages": db("SELECT COUNT(*) c FROM messages")[0]["c"],
                        "forwarded": db("SELECT COUNT(*) c FROM profiles WHERE fwd_count>0")[0]["c"],
                        "discount": db("SELECT COUNT(*) c FROM profiles WHERE discount=1")[0]["c"]}}
+
+
+@app.get("/dashboard/api/sheet")
+def dash_sheet_status(auth: bool = Depends(check_auth)):
+    return {**_sheet_state, "rows": len(_row_of)}
+
+
+@app.post("/dashboard/api/sheet/sync")
+def dash_sheet_sync(auth: bool = Depends(check_auth)):
+    """Push every known student to the sheet (also fills in students who chatted before the sheet worked)."""
+    if not _students:
+        return {"ok": False, "error": _sheet_state["error"] or "Google Sheets is not connected"}
+    if _sheet_state["syncing"]:
+        return {"ok": True, "started": False}
+    phones = [r["phone"] for r in db("SELECT DISTINCT phone FROM messages")]
+
+    def run():
+        _sheet_state["syncing"] = f"0/{len(phones)}"
+        for i, ph in enumerate(phones, 1):
+            sync_student_row(ph)
+            _sheet_state["syncing"] = f"{i}/{len(phones)}"
+            time.sleep(1.5)  # stay under Google's per-minute write quota
+        _sheet_state["syncing"] = ""
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"ok": True, "started": True, "count": len(phones)}
 
 
 DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Leaders Academia Dashboard</title>
