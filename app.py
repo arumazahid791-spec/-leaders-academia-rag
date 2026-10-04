@@ -187,10 +187,25 @@ CREATE TABLE IF NOT EXISTS profiles(phone TEXT PRIMARY KEY, name TEXT DEFAULT ''
 CREATE TABLE IF NOT EXISTS media(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, keywords TEXT, mime TEXT, data BLOB);
 CREATE TABLE IF NOT EXISTS media_sent(phone TEXT, media_id INTEGER, time TEXT);
 """)
+try:
+    _db.execute("ALTER TABLE messages ADD COLUMN by_admin INTEGER DEFAULT 0")
+    _db.commit()
+except sqlite3.OperationalError:
+    pass  # column already exists
+try:
+    _db.execute("ALTER TABLE profiles ADD COLUMN bot_paused INTEGER DEFAULT 0")
+    _db.commit()
+except sqlite3.OperationalError:
+    pass
 
 
 def now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def pk_now():
+    """Current time in Pakistan (UTC+5), independent of the server's timezone."""
+    return datetime.datetime.now(datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=5)))
 
 
 def db(sql, args=(), write=False):
@@ -227,10 +242,11 @@ def log_message(phone, direction, msg_type, text):
 def get_history(user_id):
     """Last messages from the database. The newest incoming message is dropped
     because it is passed to the model separately as USER MESSAGE."""
-    rows = db("SELECT direction,text FROM messages WHERE phone=? ORDER BY id DESC LIMIT 13", (user_id,))[::-1]
+    rows = db("SELECT direction,text,by_admin FROM messages WHERE phone=? ORDER BY id DESC LIMIT 30", (user_id,))[::-1]
     if rows and rows[-1]["direction"] == "in":
         rows = rows[:-1]
-    return [("user" if r["direction"] == "in" else "assistant", r["text"]) for r in rows]
+    return [("user" if r["direction"] == "in" else "assistant",
+             ("(message written by the team admin) " if r["by_admin"] else "") + r["text"]) for r in rows]
 
 
 def add_to_history(user_id, role, text):
@@ -424,10 +440,16 @@ GRAMMAR GENDER RULE: in Urdu/Roman Urdu always use FEMININE verb forms for yours
 LANGUAGE RULE: reply in the SAME language/script the student used. If they write English, reply fully in
 English. Roman Urdu -> Roman Urdu. Urdu script -> Urdu script.
 
+CURRENT TIME (Pakistan, PKT): {pk_now().strftime('%A, %d %B %Y, %I:%M %p')}. If asked the time or date, answer from this
+exactly; never guess or invent a different time.
+
 KNOWN STUDENT INFO: {profile_text(profile) if user_id else 'n/a'}
-Never ask again for anything already known above or already given in the conversation. If the name is
-unknown and the student shows interest, ask ONCE in a short form-like text, e.g. "Aap apna naam aur city
-is format mein bhej dein:\nName:\nCity:" (English version for English chats). Use their name naturally.
+EARLIER NOTES ABOUT THIS STUDENT (from past days, oldest first): {(profile.get('remarks') or 'none')[-700:] if user_id else 'n/a'}
+Never ask again for anything already known above or already given in the conversation.
+COLLECT DETAILS RULE: if the name or city is still unknown, ask for them ONCE as soon as the student sends a second
+message or shows any interest in a course. First answer their question, then add a short form-like text, e.g.
+"Aap apna naam aur city is format mein bhej dein:\nName:\nCity:" (English version for English chats). Do not ask
+if CONVERSATION SO FAR shows you already asked. Use their name naturally once you know it.
 
 MEMORY RULE: use CONVERSATION SO FAR to understand "this/it/the course". Never re-explain what you already
 explained; for a focused follow-up give a short, direct answer.
@@ -447,8 +469,22 @@ Never give bank / JazzCash / Easypaisa account numbers - say the team head will 
 REVIEWS: never volunteer that there are no reviews. If asked, be honest but positive: we are a growing
 academy with new batches, and the team head can connect them with students / answer in detail.
 
-ENROLLMENT RULE: if the student wants to enroll / take admission / join / register / pay, do NOTHING else:
-reply in 1-2 short lines that the team head will complete the enrollment and that you are sharing the
+COURSE FOCUS RULE: our flagship course is AI & Automation. When a student is undecided, asks "which course",
+asks for suggestions, or is just exploring, recommend AI & Automation FIRST with its real practical benefit
+(in-demand skill, freelancing/jobs, installments available, PKR 5,000 off when the full fee is paid at once), and
+gently steer toward it. Still answer honestly about any other course they ask about, and if their goal clearly fits
+another course better (e.g. video editing), say so. Never exaggerate and never guarantee a job or income.
+
+SERIOUS STUDENT RULE (very important): share the team head's number / use [[HEAD]] ONLY for a SERIOUS student:
+someone who has clearly chosen or asked about a specific course AND clearly says they want to enroll / take admission
+/ register / pay / start, or who asks for a discount or the head after the fees flow, or who explicitly asks for the
+head. NEVER share the head number for greetings, jokes, banter, testing, vague messages, general questions, people
+still exploring, or sentences like "I will follow your guidance". For those, keep chatting and guide them toward a
+course (AI & Automation first) and ask what they want to achieve. When you simply lack a detail, say the team will
+confirm it, and share the head only if the student is serious.
+
+ENROLLMENT RULE: if a SERIOUS student (see rule above) wants to enroll / take admission / join / register / pay, do
+NOTHING else: reply in 1-2 short lines that the team head will complete the enrollment and that you are sharing the
 number, then end with [[HEAD]]. No course pitch, no extra questions.
 
 FEES-TOO-HIGH FLOW (when the student says fees are high): ask ONE thing per message.
@@ -463,8 +499,8 @@ FEES-TOO-HIGH FLOW (when the student says fees are high): ask ONE thing per mess
 
 TEAM HEAD NUMBER: never write the digits yourself. Write a short sentence such as "main number share kar
 rahi hoon" (or "I'm sharing the number") and put [[HEAD]] at the end of it.
-WHEN YOU DON'T KNOW something about Leaders Academia: say naturally you don't have that detail and share
-the team head the same way ([[HEAD]]).
+WHEN YOU DON'T KNOW something about Leaders Academia: say naturally that the team will confirm that detail;
+add [[HEAD]] only if the student is serious (see SERIOUS STUDENT RULE).
 
 COMPLETE COURSE LIST (authoritative; keep this order, skip none, invent none):
 {COURSE_LIST_TEXT}
@@ -737,12 +773,11 @@ STUDENTS_TAB = os.environ.get("GOOGLE_SHEET_TAB_NAME", "Student Leads")
 AGENT_NAME = os.environ.get("SHEET_AGENT_NAME", "AI Agent")
 SUMMARY_INTERVAL_SECONDS = 2 * 60 * 60
 # Same layout as the team's daily sheet: A agent, B contact, C name, D remarks, E course (dropdown), F QA remark
-STUDENT_HEADERS = ["Agent name", "Customer contact #", "Customer Name", "Remarks", "interested course", "QA Remark",
-                   "City", "Qualification", "Motive", "Status", "Discount Requested", "Head Reply"]
+STUDENT_HEADERS = ["Agent name", "Customer contact #", "Customer Name", "Remarks", "interested course", "QA Remark"]
 SUMMARY_HEADERS = ["Time window", "Total numbers", "New", "Returning", "Interested", "Not Interested",
                    "Fee asked", "Discount requests", "Forwarded to head", "Voice notes received", "Media sent"]
 DETAIL_HEADERS = ["Window end", "Phone", "Name", "Student asked", "Agent replied", "Status"]
-_students = _summary = _details = None
+_ss = _students = _summary = _details = None
 _row_of = {}
 _manual_rows = set()
 _sheet_state = {"connected": False, "error": "", "last_ok": "", "last_error": "", "tab": "", "email": "", "syncing": ""}
@@ -833,11 +868,10 @@ def sync_student_row(phone):
         p = get_profile(phone)
         key = _norm_phone(phone)
         course = _match_course(p["course"])
-        extra = [p["city"], p["qualification"], p["motive"], p["status"], "Yes" if p["discount"] else "No"]
         with _sheet_lock:
             r = _row_of.get(key)
             if not r:
-                res = _students.append_row([AGENT_NAME, phone, p["name"], p["remarks"], course, ""] + extra + [""],
+                res = _students.append_row([AGENT_NAME, phone, p["name"], p["remarks"], course, ""],
                                            value_input_option="RAW")
                 m = re.search(r"!A(\d+)", res["updates"]["updatedRange"])
                 r = int(m.group(1))
@@ -845,7 +879,7 @@ def sync_student_row(phone):
             elif r in _manual_rows:
                 cur = _students.row_values(r)
                 cur += [""] * (6 - len(cur))
-                upd = [{"range": f"G{r}:K{r}", "values": [extra]}]
+                upd = []
                 if p["name"] and not cur[2].strip():
                     upd.append({"range": f"C{r}", "values": [[p["name"]]]})
                 if course and not cur[4].strip():
@@ -853,14 +887,14 @@ def sync_student_row(phone):
                 last = (p["remarks"] or "").split(" | ")[-1].strip()
                 if last and last not in cur[3]:
                     upd.append({"range": f"D{r}", "values": [[(cur[3] + " | " if cur[3].strip() else "") + last]]})
-                _students.batch_update(upd, value_input_option="RAW")
+                if upd:
+                    _students.batch_update(upd, value_input_option="RAW")
             else:
-                _students.batch_update([{"range": f"B{r}:E{r}", "values": [[phone, p["name"], p["remarks"], course]]},
-                                        {"range": f"G{r}:K{r}", "values": [extra]}],
+                _students.batch_update([{"range": f"B{r}:E{r}", "values": [[phone, p["name"], p["remarks"], course]]}],
                                        value_input_option="RAW")
             yellow = {"backgroundColor": {"red": 1, "green": 1, "blue": 0}}
             white = {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}
-            _students.format(f"A{r}:L{r}", yellow if p["status"] == "Not Interested" else white)
+            _students.format(f"A{r}:F{r}", yellow if p["status"] == "Not Interested" else white)
         _sheet_state["last_ok"] = now()
     except Exception as e:
         _sheet_state["last_error"] = f"{now()} UTC - {_friendly_sheet_error(e)}"[:400]
@@ -873,7 +907,7 @@ def extract_and_sync(phone):
         p = get_profile(phone)
         prompt = f"""Read this WhatsApp chat between a potential student and Leaders Academia's assistant.
 Return STRICT JSON only, no other text:
-{{"name":"","city":"","qualification":"","motive":"","course":"","status":"Interested | Not Interested | Follow-up Needed | Enrolled (pick one)","discount_requested":false,"no_voice":false,"remark":"max 6 words on what happened in the latest messages"}}
+{{"name":"","city":"","qualification":"","motive":"","course":"","status":"Interested | Not Interested | Follow-up Needed | Enrolled (pick one)","discount_requested":false,"no_voice":false,"remark":"max 12 words: what the STUDENT said or asked in the latest messages, starting with Student: (example: Student: fee poochi, AI course mein interest)"}}
 Use "" when unknown. no_voice=true only if the student asked not to get voice messages. Already known: {profile_text(p)}
 
 CHAT:
@@ -986,17 +1020,47 @@ def send_template_or_text(to, template, name, text):
     return r.status_code == 200
 
 
+FOLLOWUP_AFTER_HOURS = float(os.environ.get("FOLLOWUP_AFTER_HOURS", "20"))   # no reply from an interested/undecided student
+CHECKIN_AFTER_HOURS = float(os.environ.get("CHECKIN_AFTER_HOURS", "20"))     # after the student was sent to the team head
+FOLLOWUP_START_HOUR = int(os.environ.get("FOLLOWUP_START_HOUR", "10"))       # Pakistan time window for sending
+FOLLOWUP_END_HOUR = int(os.environ.get("FOLLOWUP_END_HOUR", "20"))
+
+
+def _hours_ago(h):
+    return (datetime.datetime.now() - datetime.timedelta(hours=h)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _can_send_followup(p, template):
+    """Without an approved template WhatsApp only delivers free text within 24h of the student's last message."""
+    if template:
+        return True
+    try:
+        last = datetime.datetime.strptime(p["last_in"], "%Y-%m-%d %H:%M:%S")
+        return (datetime.datetime.now() - last).total_seconds() < 23.5 * 3600
+    except Exception:
+        return False
+
+
 def do_followups():
-    t3 = (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
-    t2 = (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
-    for p in db("SELECT * FROM profiles WHERE status='Interested' AND followup_sent=0 AND fwd_count=0 AND last_in!='' AND last_in<?", (t3,)):
+    if not (FOLLOWUP_START_HOUR <= pk_now().hour < FOLLOWUP_END_HOUR):
+        return  # do not message students late at night
+    rows = db("""SELECT * FROM profiles WHERE status IN ('Interested','Follow-up Needed') AND followup_sent=0
+                 AND fwd_count=0 AND bot_paused=0 AND last_in!='' AND last_in<?
+                 AND (SELECT COUNT(*) FROM messages m WHERE m.phone=profiles.phone AND m.direction='in')>=2""",
+              (_hours_ago(FOLLOWUP_AFTER_HOURS),))
+    for p in rows:
+        if not _can_send_followup(p, WA_FOLLOWUP_TEMPLATE):
+            continue
         n = p["name"] or "there"
-        text = f"Assalamualaikum {n}! Aap ne Leaders Academia ke course mein interest dikhaya tha. Koi sawal ho to bata dein, main madad kar dungi."
+        about = f"{p['course']} course" if p["course"] else "Leaders Academia ke courses"
+        text = f"Assalamualaikum {n}! Aap ne {about} ke baare mein baat ki thi. Koi sawal ho to bata dein, main madad kar dungi."
         if send_template_or_text(p["phone"], WA_FOLLOWUP_TEMPLATE, p["name"], text):
             log_message(p["phone"], "out", "text", text)
             update_profile(p["phone"], followup_sent=1, remarks=(p["remarks"] + " | " if p["remarks"] else "") + datetime.datetime.now().strftime("%d %b") + " follow-up sent")
             sync_student_row(p["phone"])
-    for p in db("SELECT * FROM profiles WHERE fwd_count>0 AND checkin_sent=0 AND fwd_time!='' AND fwd_time<?", (t2,)):
+    for p in db("SELECT * FROM profiles WHERE fwd_count>0 AND checkin_sent=0 AND bot_paused=0 AND fwd_time!='' AND fwd_time<?", (_hours_ago(CHECKIN_AFTER_HOURS),)):
+        if not _can_send_followup(p, WA_CHECKIN_TEMPLATE):
+            continue
         n = p["name"] or "there"
         text = f"Assalamualaikum {n}! Kya aap ki {TEAM_HEAD_NAME} se baat ho gayi? Unhon ne kya kaha, bata dijiye."
         if send_template_or_text(p["phone"], WA_CHECKIN_TEMPLATE, p["name"], text):
@@ -1007,7 +1071,7 @@ def do_followups():
 
 async def run_followups():
     while True:
-        await asyncio.sleep(1800)
+        await asyncio.sleep(900)
         try:
             await asyncio.to_thread(do_followups)
         except Exception as e:
@@ -1032,6 +1096,12 @@ def verify_webhook(request: Request):
 async def handle_user_text(frm, user_text, is_voice):
     log_message(frm, "in", "voice" if is_voice else "text", user_text)
     p = get_profile(frm)
+    if p["bot_paused"]:  # admin has taken over this chat: log it, update the sheet, but do not reply
+        asyncio.create_task(asyncio.to_thread(extract_and_sync, frm))
+        if ADMIN_ALERT_NUMBER:
+            await asyncio.to_thread(send_whatsapp_message, ADMIN_ALERT_NUMBER,
+                                    f"Student replied in a PAUSED chat: {p['name'] or 'name unknown'} ({frm}): {user_text[:150]}")
+        return
     reply = await asyncio.to_thread(rag_answer, user_text, frm, bool(is_voice and not p["no_voice"]))
     forwarded = record_forward_if_needed(frm, reply)
     head = f"{TEAM_HEAD_NAME}: {TEAM_HEAD_NUMBER}"
@@ -1139,7 +1209,41 @@ def dash_chats(filter: str = "all", hours: int = 0, auth: bool = Depends(check_a
 
 @app.get("/dashboard/api/chat/{phone}")
 def dash_chat(phone: str, auth: bool = Depends(check_auth)):
-    return {"messages": db("SELECT id,time,direction,type,text,good FROM messages WHERE phone=? ORDER BY id", (phone,))}
+    return {"messages": db("SELECT id,time,direction,type,text,good,by_admin FROM messages WHERE phone=? ORDER BY id", (phone,))}
+
+
+@app.post("/dashboard/api/pause/{phone}")
+async def dash_pause(phone: str, request: Request, auth: bool = Depends(check_auth)):
+    """Pause / resume the agent for one chat (admin takes over)."""
+    body = await request.json()
+    get_profile(phone)
+    update_profile(phone, bot_paused=1 if body.get("paused") else 0)
+    return {"ok": True, "paused": bool(body.get("paused"))}
+
+
+@app.post("/dashboard/api/send")
+async def dash_send(request: Request, auth: bool = Depends(check_auth)):
+    """Admin writes to a student from the dashboard (shown in the chat as an Admin message)."""
+    body = await request.json()
+    phone = str(body.get("phone", "")).strip()
+    text = str(body.get("text", "")).strip()
+    if not phone or not text:
+        return JSONResponse({"ok": False, "error": "Write a message first"}, status_code=400)
+    if len(text) > 3500:
+        return JSONResponse({"ok": False, "error": "Message is too long"}, status_code=400)
+    try:
+        r = await asyncio.to_thread(send_whatsapp_message, phone, text)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Could not reach WhatsApp: {e}"}, status_code=502)
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("error", {}).get("message", "")
+        except Exception:
+            detail = ""
+        hint = " WhatsApp only allows free messages within 24 hours of the student's last message." if r.status_code in (400, 403) else ""
+        return JSONResponse({"ok": False, "error": (detail or f"WhatsApp error {r.status_code}") + hint}, status_code=502)
+    db("INSERT INTO messages(phone,time,direction,type,text,by_admin) VALUES(?,?,?,?,?,1)", (phone, now(), "out", "text", text), write=True)
+    return {"ok": True}
 
 
 @app.post("/dashboard/api/good/{mid}")
@@ -1150,15 +1254,18 @@ def dash_good(mid: int, auth: bool = Depends(check_auth)):
 
 @app.get("/dashboard/api/people")
 def dash_people(kind: str, auth: bool = Depends(check_auth)):
-    t3 = (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
     if kind == "fol":
-        rows = db("SELECT phone,name,course,last_in,followup_sent FROM profiles WHERE status='Interested' AND last_in!='' ORDER BY last_in DESC")
+        rows = db("""SELECT phone,name,course,last_in,followup_sent FROM profiles
+                     WHERE status IN ('Interested','Follow-up Needed') AND last_in!='' AND fwd_count=0
+                     AND (SELECT COUNT(*) FROM messages m WHERE m.phone=profiles.phone AND m.direction='in')>=2
+                     ORDER BY last_in DESC""")
+        due = _hours_ago(FOLLOWUP_AFTER_HOURS)
         for r in rows:
-            r["state"] = "Follow-up sent" if r["followup_sent"] else ("Due now" if r["last_in"] < t3 else "Waiting (under 3 days)")
+            r["state"] = "Follow-up sent" if r["followup_sent"] else ("Due now" if r["last_in"] < due else f"Waiting (under {FOLLOWUP_AFTER_HOURS:g}h)")
     else:
         rows = db("SELECT phone,name,course,fwd_count,fwd_time,checkin_sent FROM profiles WHERE fwd_count>0 ORDER BY fwd_time DESC")
         for r in rows:
-            r["state"] = "Check-in sent" if r["checkin_sent"] else "Waiting for 2-day check-in"
+            r["state"] = "Check-in sent" if r["checkin_sent"] else f"Waiting for {CHECKIN_AFTER_HOURS:g}h check-in"
     return {"people": rows}
 
 
@@ -1231,6 +1338,63 @@ def dash_analytics(days: int = 14, tz: int = 0, auth: bool = Depends(check_auth)
                        "messages": db("SELECT COUNT(*) c FROM messages")[0]["c"],
                        "forwarded": db("SELECT COUNT(*) c FROM profiles WHERE fwd_count>0")[0]["c"],
                        "discount": db("SELECT COUNT(*) c FROM profiles WHERE discount=1")[0]["c"]}}
+
+
+def _sheet_wipe_all():
+    """Remove all data rows (keeps header row) from the three bot tabs."""
+    if not _ss:
+        return
+    for ws in (_students, _summary, _details):
+        if ws:
+            try:
+                n = max(ws.row_count, 2)
+                ws.batch_clear([f"A2:Z{n}"])
+                ws.format(f"A2:Z{n}", {"backgroundColor": {"red": 1, "green": 1, "blue": 1}})
+            except Exception as e:
+                print(f"Sheet clear failed for {getattr(ws, 'title', '?')}: {e}")
+    _row_of.clear()
+    _manual_rows.clear()
+
+
+@app.post("/dashboard/api/clear-all")
+async def dash_clear_all(request: Request, auth: bool = Depends(check_auth)):
+    """Delete ALL chat history, student profiles and sheet rows. Posters (media) are kept."""
+    body = await request.json()
+    if body.get("confirm") != "DELETE":
+        return JSONResponse({"ok": False, "error": "Type DELETE to confirm"}, status_code=400)
+    for t in ("messages", "profiles", "media_sent"):
+        db(f"DELETE FROM {t}", write=True)
+    with _sheet_lock:
+        await asyncio.to_thread(_sheet_wipe_all)
+    return {"ok": True}
+
+
+@app.delete("/dashboard/api/chat/{phone}")
+def dash_delete_chat(phone: str, auth: bool = Depends(check_auth)):
+    """Delete one student's chat, profile and sheet row."""
+    for t in ("messages", "profiles", "media_sent"):
+        db(f"DELETE FROM {t} WHERE phone=?", (phone,), write=True)
+    key = _norm_phone(phone)
+    with _sheet_lock:
+        r = _row_of.pop(key, None)
+        try:
+            if r and _students:
+                _students.delete_rows(r)
+                for k, v in list(_row_of.items()):
+                    if v > r:
+                        _row_of[k] = v - 1
+                _manual_rows.discard(r)
+                for x in {m for m in _manual_rows if m > r}:
+                    _manual_rows.discard(x)
+                    _manual_rows.add(x - 1)
+            if _details:
+                vals = _details.col_values(2)
+                for i in range(len(vals), 1, -1):
+                    if _norm_phone(vals[i - 1]) == key:
+                        _details.delete_rows(i)
+        except Exception as e:
+            print(f"Sheet row delete failed for {phone}: {e}")
+    return {"ok": True}
 
 
 @app.get("/dashboard/api/sheet")
