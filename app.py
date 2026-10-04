@@ -777,6 +777,11 @@ STUDENT_HEADERS = ["Agent name", "Customer contact #", "Customer Name", "Remarks
 SUMMARY_HEADERS = ["Time window", "Total numbers", "New", "Returning", "Interested", "Not Interested",
                    "Fee asked", "Discount requests", "Forwarded to head", "Voice notes received", "Media sent"]
 DETAIL_HEADERS = ["Window end", "Phone", "Name", "Student asked", "Agent replied", "Status"]
+def _norm_phone(v):
+    d = re.sub(r"\D", "", str(v))
+    return d[-10:] if len(d) >= 10 else d
+
+
 _ss = _students = _summary = _details = None
 _row_of = {}
 _manual_rows = set()
@@ -841,11 +846,6 @@ else:
     _missing = [n for n, v in (("GOOGLE_SHEETS_CREDENTIALS_JSON", GOOGLE_SHEETS_CREDENTIALS_JSON), ("GOOGLE_SHEET_ID", GOOGLE_SHEET_ID)) if not v]
     _sheet_state["error"] = "Railway variable(s) missing: " + ", ".join(_missing)
     print("Google Sheets env vars not set - sheets disabled.")
-
-
-def _norm_phone(v):
-    d = re.sub(r"\D", "", str(v))
-    return d[-10:] if len(d) >= 10 else d
 
 
 def _match_course(c):
@@ -1482,9 +1482,9 @@ fetch('/dashboard/api/chats').then(r=>{if(r.ok){$('#login').style.display='none'
 def dashboard_page():
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html"), encoding="utf-8") as f:
-            return HTMLResponse(f.read())
+            return HTMLResponse(f.read(), headers={"Cache-Control": "no-store"})
     except Exception:
-        return HTMLResponse(DASHBOARD_HTML)
+        return HTMLResponse(DASHBOARD_HTML, headers={"Cache-Control": "no-store"})
 
 
 from fastapi.responses import RedirectResponse
