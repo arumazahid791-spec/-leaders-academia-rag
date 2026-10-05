@@ -93,6 +93,22 @@ header#top p{margin:2px 0 0;color:var(--mute);font-size:12.5px}
 .pbtn.on{background:#dcfce7;color:#166534;border-color:#86efac}
 .pbtn svg{width:15px;height:15px}
 .s-paused{background:#fff1d6;color:#b45309}
+.tq{padding:16px 18px;margin-bottom:14px}
+.tqh{display:flex;justify-content:space-between;color:var(--mute);font-size:12px}
+.tqq{font-weight:700;font-size:15px;margin:8px 0}
+.tq details{margin:4px 0 8px;font-size:12.5px;color:var(--mute)}
+.tq pre{white-space:pre-wrap;font:inherit;background:#f6f4ff;border-radius:10px;padding:8px 10px;margin:6px 0 0}
+.tq textarea,.tf textarea,.tf input[type=text]{width:100%;border:1px solid #d9d0ff;border-radius:14px;padding:10px 12px;font:inherit;outline:none;background:#fff;margin:6px 0}
+.tq textarea,.tf textarea{min-height:72px;resize:vertical}
+.tq textarea:focus,.tf textarea:focus,.tf input:focus{border-color:var(--brand);box-shadow:0 0 0 3px #7c5cff26}
+.tact{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px}
+.tact label{font-size:12.5px;color:var(--mute);display:flex;gap:6px;align-items:center}
+.btn.gh{background:#f1eeff;color:#4c2a9a;box-shadow:none}
+.tf{padding:16px 18px;margin-bottom:18px}.tf h3,.tl2 h3{margin:0 0 4px;font-size:15px}
+.tf p{margin:0 0 8px;color:var(--mute);font-size:12.5px}
+.ln{padding:12px 16px;border-bottom:1px solid #f1f3f7;display:flex;gap:12px;align-items:flex-start}
+.ln:last-child{border:0}.ln .t{flex:1;min-width:0}.ln b{display:block;margin-bottom:2px}.ln small{color:var(--mute)}
+.sec2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--mute);margin:20px 4px 10px}
 .pausebar{background:#fff7e0;border-bottom:1px solid #fbd38d;color:#92400e;font-size:12.5px;padding:8px 18px}
 .ib#ibDel{display:grid;color:#b91c1c;background:#fee2e2}
 .danger{margin-top:18px;padding:16px 18px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;border-color:#fecaca}
@@ -226,7 +242,7 @@ tr.cl{cursor:pointer}tr.cl:hover td{background:#f6f4ff}
 
 <div id="app">
   <aside>
-    <div class="logo"><i>L</i><div><b>Leaders Academia</b><small>WhatsApp Admissions Agent · v3</small></div></div>
+    <div class="logo"><i>L</i><div><b>Leaders Academia</b><small>WhatsApp Admissions Agent · v4</small></div></div>
     <div class="sec">Overview</div>
     <div id="nav0"></div>
     <div class="sec">Conversations</div>
@@ -273,6 +289,7 @@ const IC={
  trash:'<svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg>',
  pause:'<svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
  play:'<svg viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></svg>',
+ cap:'<svg viewBox="0 0 24 24"><path d="M22 10 12 5 2 10l10 5 10-5z"/><path d="M6 12v5c3 2 9 2 12 0v-5"/></svg>',
  back:'<svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>'
 };
 const VIEWS={
@@ -283,6 +300,7 @@ const VIEWS={
  hist:{t:'History',s:'Every conversation, newest first',i:'clock',g:1,chat:1},
  fol:{t:'Follow-ups',s:'Interested students waiting for a follow-up message',i:'bell',g:2,people:1},
  fwd:{t:'Forwarded',s:'Students handed over to the team head',i:'fwd',g:2,people:1},
+ train:{t:'Training Room',s:'Questions the agent could not answer, and everything it has learned',i:'cap',g:2},
  media:{t:'Media',s:'Posters the agent sends when a course is mentioned',i:'img',g:2}
 };
 let view='analytics',sel=null,ALL=[],LIVE=[],MSGS=[],sig='',lastSel=null,busy=false;
@@ -352,6 +370,7 @@ async function refresh(force){
   ALL=(await api('/dashboard/api/chats?filter=all&hours=0')).chats;
   LIVE=(await api('/dashboard/api/chats?filter=all&hours=24')).chats;
   badges();chips();
+  try{const tc=await api('/dashboard/api/training/count');const e=$('#n_train');if(e){e.style.display=tc.pending?'inline-block':'none';e.textContent=tc.pending}}catch(e){}
   const V=VIEWS[view];
   const sh=(id,on)=>$(id).style.display=on?'flex':'none';
   sh('#list',!!V.chat);sh('#conv',!!V.chat);$('#pane').style.display=V.chat?'none':'block';
@@ -359,6 +378,7 @@ async function refresh(force){
   if(V.chat){await drawChats(force)}
   else if(V.people){await drawPeople()}
   else if(view==='media'){if(force||!$('#mt'))await drawMedia()}
+  else if(view==='train'){await drawTraining(force)}
   else if(view==='analytics'){if(force||Date.now()-anT>30000)await drawAnalytics()}
  }catch(e){}
  busy=false}
@@ -393,7 +413,7 @@ async function drawChats(force){
   body+=`<div class="row ${o?'out':'in'}"><div class="bub ${o?'out':'in'} ${adm?'adm':''}"><div class="who">${adm?'Admin (sent from dashboard)':(o?'Agent':esc(c.name||'Student'))}</div>
    ${m.type==='voice'?`<div class="vn">${IC.mic.replace('<svg','<svg style="width:13px;height:13px"')} Voice message</div>`:''}
    <div class="txt">${fmt(m.text)}</div>
-   <div class="meta">${o&&!adm?`<button class="th ${m.good?'on':''}" data-good="${m.id}" title="Mark as good reply">${m.good?'★ good example':'☆'}</button>`:''}<span>${tm(m.time)}</span></div></div></div>`}
+   <div class="meta">${o&&!adm?`<button class="th" data-teach="${m.id}" title="Wrong or incomplete answer? Teach the agent the right one">✎ Teach</button><button class="th ${m.good?'on':''}" data-good="${m.id}" title="Mark as good reply">${m.good?'★ good example':'☆'}</button>`:''}<span>${tm(m.time)}</span></div></div></div>`}
  const old=$('#msgs'),near=!old||(old.scrollHeight-old.scrollTop-old.clientHeight<120);
  const dr=$('#cmp'),draft=dr&&lastSel===sel?dr.value:'',foc=dr&&document.activeElement===dr;
  $('#conv').innerHTML=head+(c.bot_paused?'<div class="pausebar">Agent is paused for this chat: the student\'s messages are saved but nobody replies automatically. Reply from the box below, then press Resume agent.</div>':'')+`<div id="msgs">${body||'<div class="none">No messages yet</div>'}</div>
@@ -499,6 +519,7 @@ async function drawAnalytics(){
  <div class="rng">${[7,14,30].map(x=>`<button class="${x===anDays?'on':''}" onclick="anDays=${x};drawAnalytics()">Last ${x} days</button>`).join('')}
   <span style="margin-left:auto;color:var(--mute);font-size:12px">Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · times in your local timezone</span></div>
  <div class="card sh" id="sheetcard"></div>
+ <div class="card sh" id="aicard"></div>
  <div class="kp">
   ${kpi('Messages from students today',d.msg_in[td],d.msg_in[td],d.msg_in[yd]??0,'#22c1dc')}
   ${kpi('Active students today',d.active[td],d.active[td],d.active[yd]??0,'#7c5cff')}
@@ -528,7 +549,17 @@ async function drawAnalytics(){
    <div style="margin-top:14px">${hbars(d.cities)}</div></div>
  </div>
  <div class="card danger"><div class="tx"><b>Clear all history</b><br>Deletes every chat, student profile and the rows in the Google Sheet tabs (Student Leads, 2 Hour Summary, 2 Hour Details). Posters are kept. This cannot be undone.</div>
-  <button class="btn dg" onclick="clearAll()">Delete all history</button></div>`;loadSheet()}
+  <button class="btn dg" onclick="clearAll()">Delete all history</button></div>`;loadSheet();loadAI()}
+
+/* ---------- AI engine status ---------- */
+async function loadAI(){
+ const el=$('#aicard');if(!el)return;
+ let st;try{st=await api('/dashboard/api/ai')}catch(e){return}
+ const bad=st.last_error&&(!st.last_ok||st.last_error.slice(0,19)>st.last_ok);
+ el.innerHTML=`<span class="dot" style="background:${bad?'#ef4444':'#22c55e'}"></span>
+  <div class="tx"><b>AI replies · ${bad?'Problem':'Working'}</b>
+  <div class="ok">${st.last_ok?'Last successful reply: '+full(st.last_ok):'No reply generated since the last restart'} · backup AI (Groq): ${st.groq?'on':'<b style="color:#b91c1c">not set</b>'}</div>
+  ${st.last_error?`<div class="er">Last error: ${esc(st.last_error)}</div>`:''}</div>`}
 
 /* ---------- google sheet status ---------- */
 async function loadSheet(){
@@ -583,12 +614,60 @@ async function clearAll(){
  const r=await api('/dashboard/api/clear-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'DELETE'})});
  toast(r.ok?'All history deleted':(r.error||'Failed'));sel=null;sig='';anT=0;refresh(true)}
 
+/* ---------- training room ---------- */
+let trSig='';
+async function drawTraining(force){
+ const d=await api('/dashboard/api/training');
+ const sg=JSON.stringify([d.pending.map(x=>x.id),d.learned.map(x=>x.id),d.done.map(x=>x.id)]);
+ if(!force&&sg===trSig&&$('#trw'))return;trSig=sg;
+ const dr={};document.querySelectorAll('[data-draft]').forEach(e=>dr[e.dataset.draft]=e.value);
+ const srcTag=s=>`<span class="pill" style="background:#f1eeff;color:#4c2a9a">${esc(s||'admin')}</span>`;
+ $('#pane').innerHTML=`<div id="trw">
+  <div class="card tf"><h3>Teach the agent</h3><p>Add a fact or a correct answer. The agent will use it in every future chat and trust it above everything else.</p>
+   <input type="text" id="lq" placeholder="Question a student might ask (e.g. Who is the AI &amp; Automation instructor?)">
+   <textarea id="la" placeholder="The correct answer (e.g. Sir Ahmed teaches it, 6 years experience in ...)"></textarea>
+   <div class="tact"><button class="btn" onclick="addLearn()">Save to agent's memory</button></div></div>
+  <div class="sec2">Waiting for your answer (${d.pending.length})</div>
+  ${d.pending.map(x=>`<div class="card tq"><div class="tqh"><b>${esc(x.who)} · ${esc(x.phone)}</b><span>${full(x.time)}</span></div>
+    <div class="tqq">${esc(x.question)}</div>
+    <details><summary>Chat context</summary><pre>${esc(x.context||'')}</pre></details>
+    <textarea data-draft="a${x.id}" placeholder="Write the correct answer for the agent…"></textarea>
+    <div class="tact"><button class="btn" data-ans="${x.id}">Answer &amp; teach agent</button><button class="btn gh" data-ign="${x.id}">Ignore</button>
+     <label><input type="checkbox" data-sendchk="${x.id}" checked> Also send it to the student</label></div></div>`).join('')||'<div class="card e" style="padding:26px">No open questions. When the agent does not know something, it will leave the question here.</div>'}
+  <div class="sec2">What the agent has learned (${d.learned.length})</div>
+  <div class="card">${d.learned.map(x=>`<div class="ln"><div class="t"><b>${esc(x.question)}</b>${esc(x.answer)}<br><small>${full(x.time)}</small></div>${srcTag(x.source)}
+    <button class="btn d" data-dellearn="${x.id}">Delete</button></div>`).join('')||'<div class="e">Nothing learned yet</div>'}</div>
+ </div>`;
+ document.querySelectorAll('[data-draft]').forEach(e=>{if(dr[e.dataset.draft]!==undefined)e.value=dr[e.dataset.draft]})}
+async function addLearn(){
+ const q=$('#lq').value.trim(),a=$('#la').value.trim();if(!q||!a){toast('Write both the question and the answer');return}
+ const r=await api('/dashboard/api/learn',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,answer:a})});
+ toast(r.ok?'Saved. The agent will use this from now on':(r.error||'Failed'),2500);trSig='';drawTraining(true)}
+async function answerQ(id){
+ const ta=document.querySelector(`[data-draft="a${id}"]`),txt=ta.value.trim();if(!txt){toast('Write the answer first');return}
+ const send=document.querySelector(`[data-sendchk="${id}"]`).checked;toast('Saving…');
+ const r=await api(`/dashboard/api/training/${id}/answer`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({answer:txt,send})});
+ toast(r.ok?(r.sent?'Learned, and sent to the student':(r.note||'Learned')):(r.error||'Failed'),r.note?7000:2500);trSig='';drawTraining(true);refresh(false)}
+async function ignoreQ(id){await api(`/dashboard/api/training/${id}/ignore`,{method:'POST'});trSig='';drawTraining(true);refresh(false)}
+async function delLearn(id){if(!confirm('Delete this from the agent\'s memory?'))return;await api('/dashboard/api/learned/'+id,{method:'DELETE'});trSig='';drawTraining(true)}
+async function teachMsg(id){
+ const i=MSGS.findIndex(m=>m.id==id);if(i<0)return;let q='';
+ for(let k=i-1;k>=0;k--){if(MSGS[k].direction==='in'){q=MSGS[k].text;break}}
+ const a=prompt('What is the correct answer / what should the agent have said?\n\nStudent asked: '+q.slice(0,150));
+ if(!a||!a.trim())return;
+ const r=await api('/dashboard/api/learn',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q||MSGS[i].text,answer:a.trim(),source:'correction'})});
+ toast(r.ok?'Saved. The agent will use this from now on':(r.error||'Failed'),3000)}
+
 /* ---------- events ---------- */
 document.addEventListener('keydown',e=>{if(e.target&&e.target.id==='cmp'&&e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendAdmin()}});
 document.addEventListener('click',async e=>{
  const it=e.target.closest('.it');if(it){sel=it.dataset.p;sig='';$('#info').classList.remove('open');go(view,sel);return}
  const g=e.target.closest('[data-good]');if(g){await fetch('/dashboard/api/good/'+g.dataset.good,{method:'POST'});sig='';refresh(true);return}
- const o=e.target.closest('[data-open]');if(o){go('hist',o.dataset.open)}});
+ const o=e.target.closest('[data-open]');if(o){go('hist',o.dataset.open);return}
+ const t=e.target.closest('[data-teach]');if(t){teachMsg(t.dataset.teach);return}
+ const an=e.target.closest('[data-ans]');if(an){answerQ(an.dataset.ans);return}
+ const ig=e.target.closest('[data-ign]');if(ig){ignoreQ(ig.dataset.ign);return}
+ const dl=e.target.closest('[data-dellearn]');if(dl){delLearn(dl.dataset.dellearn)}});
 $('#q').addEventListener('input',()=>{$('#items').dataset.k='';drawList()});
 setInterval(()=>{if($('#app').style.display==='flex')refresh(false)},4000);
 fetch('/dashboard/api/chats').then(r=>{if(r.ok){$('#login').style.display='none';$('#app').style.display='flex';init()}});
