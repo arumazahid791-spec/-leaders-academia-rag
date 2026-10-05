@@ -46,9 +46,11 @@ PRIORITY_COURSES = [
     "Graphic Design",
 ]
 
-HUMAN_HANDOFF_KEYWORDS = [
-    "human", "real person", "agent", "representative",
-    "insan se baat", "banda se baat", "customer support",
+HUMAN_HANDOFF_KEYWORDS = [  # specific phrases only; never single words like "agent" (students say "AI agents")
+    "real person", "real human", "talk to a human", "speak to a human", "talk to human", "speak to human",
+    "human se baat", "insan se baat", "insaan se baat", "banda se baat", "banday se baat", "kisi insan", "kisi insaan",
+    "customer support", "customer care", "representative", "team head se baat", "head se baat", "head se rabta",
+    "sir intasham", "manager se baat",
 ]
 
 # ---------- Load API key from Railway's environment variables (never hardcode it) ----------
@@ -192,6 +194,12 @@ try:
     _db.commit()
 except sqlite3.OperationalError:
     pass  # column already exists
+_db.executescript("""
+CREATE TABLE IF NOT EXISTS processed(mid TEXT PRIMARY KEY, time TEXT);
+CREATE TABLE IF NOT EXISTS learned(id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT, answer TEXT, source TEXT, time TEXT);
+CREATE TABLE IF NOT EXISTS training_q(id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT, question TEXT, context TEXT,
+  status TEXT DEFAULT 'pending', answer TEXT DEFAULT '', time TEXT, answered_time TEXT DEFAULT '');
+""")
 try:
     _db.execute("ALTER TABLE profiles ADD COLUMN bot_paused INTEGER DEFAULT 0")
     _db.commit()
@@ -310,6 +318,75 @@ def wants_human(text):
     return any(keyword in text for keyword in HUMAN_HANDOFF_KEYWORDS)
 
 
+# ---------- Training room: things the admin taught the agent ----------
+_STOP = set("""the and for with this that are you your was were what when where which who how can will have has not but all any
+hai hain kya aur mein main aap apna apni apne hum koi bhi nai nahi nahin hona karna krna kar kro kia kaise kese kitna
+kitni kitne wala wali kyun kyu liye leya ko ki ka ke se par woh yeh ye hoga hogi mujy mujhe mera meri hamara
+hamare tumhara please thanks thank ok okay hmm yes""".split())
+_SYN = {w: "teacher" for w in ("instructor", "mentor", "teacher", "trainer", "sir", "faculty", "ustad", "madam", "tutor")}
+_SYN.update({w: "fee" for w in ("fee", "fees", "price", "cost", "charges", "paise", "rupay", "rupees", "payment")})
+_SYN.update({w: "timing" for w in ("timing", "timings", "time", "schedule", "waqt", "slots", "batch")})
+_SYN.update({w: "place" for w in ("location", "address", "office", "campus", "jagah", "branch", "visit")})
+_SYN.update({w: "length" for w in ("duration", "months", "mahine", "weeks", "length")})
+
+
+def _toks(text):
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", str(text).lower()):
+        w = _SYN.get(w, w)
+        if w in _STOP or (len(w) < 3 and w != "ai" and w not in _SYN.values()):
+            continue
+        out.add(w)
+    return out
+
+
+def learned_relevant(question, n=6):
+    """Admin-taught Q/A notes that overlap with the current question."""
+    qt = _toks(question)
+    if not qt:
+        return []
+    scored = []
+    for r in db("SELECT * FROM learned ORDER BY id DESC LIMIT 400"):
+        sc = len(qt & _toks(r["question"] + " " + r["answer"]))
+        if sc >= 1:
+            scored.append((sc, r["id"], r))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    return [r for _, _, r in scored[:n]]
+
+
+def keyword_chunks(query, have, n=3):
+    """Cheap keyword search over the PDF text, to catch facts (e.g. instructor names) that the semantic search missed."""
+    qt = _toks(query)
+    scored = []
+    for c in chunks:
+        if c in have:
+            continue
+        sc = len(qt & _toks(c))
+        if sc >= 2:
+            scored.append((sc, c))
+    scored.sort(key=lambda x: -x[0])
+    return [c for _, c in scored[:n]]
+
+
+_ASK_RE = re.compile(r"\[\[ASK_ADMIN:(.*?)\]\]", re.S)
+
+
+def split_admin_question(reply):
+    """Returns (clean_reply, question_or_None) - the agent adds [[ASK_ADMIN: ...]] when it lacks a fact."""
+    m = _ASK_RE.search(reply or "")
+    if not m:
+        return (reply or "").strip(), None
+    return _ASK_RE.sub("", reply).strip(), m.group(1).strip()[:400]
+
+
+def save_training_question(phone, question):
+    if db("SELECT id FROM training_q WHERE phone=? AND question=? AND status='pending'", (phone, question)):
+        return None
+    ctx = "\n".join(f"{'Student' if role == 'user' else 'Agent'}: {text[:200]}" for role, text in get_history(phone)[-5:])
+    db("INSERT INTO training_q(phone,question,context,time) VALUES(?,?,?,?)", (phone, question, ctx, now()), write=True)
+    return db("SELECT id FROM training_q ORDER BY id DESC LIMIT 1")[0]["id"]
+
+
 def is_transient_error(e):
     """Errors that mean 'Gemini is busy / out of quota / too slow right now'."""
     text = str(e).lower()
@@ -350,40 +427,49 @@ def mark_gemini_tts_down():
     print(f"Gemini TTS marked unavailable for {GEMINI_TTS_COOLDOWN_SECONDS}s, using edge-tts meanwhile.")
 
 
+_ai_state = {"last_ok": "", "last_error": ""}
+AI_BUSY_REPLY = ("Is waqt thora zyada rush hai, is liye jawab dene mein der ho rahi hai. "
+                 "Aap ka message mil gaya hai, chand minute mein dobara message kar dein.")
+
+
 def generate_text(prompt):
     """Try Gemini first; if it's busy, out of quota or slow, fall back to Groq
-    right away — same prompt goes to both, so the tone and style of the reply
-    stays the same no matter which one actually answers."""
-    if gemini_is_up():
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL_NAME, contents=prompt
-            )
-            if response.text:
-                return response.text
-            print("Gemini returned an empty reply, falling back to Groq.")
-        except Exception as e:
-            print(f"Gemini failed, falling back to Groq: {e}")
-            if is_transient_error(e):
-                mark_gemini_down()
+    right away. Same prompt goes to both. If both fail, retry once more after a short wait."""
+    for attempt in range(2):
+        if gemini_is_up():
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL_NAME, contents=prompt
+                )
+                if response.text:
+                    _ai_state["last_ok"] = now()
+                    return response.text
+                print("Gemini returned an empty reply, falling back to Groq.")
+                _ai_state["last_error"] = f"{now()} UTC - Gemini returned an empty reply"
+            except Exception as e:
+                print(f"Gemini failed, falling back to Groq: {e}")
+                _ai_state["last_error"] = f"{now()} UTC - Gemini: {str(e)[:250]}"
+                if is_transient_error(e):
+                    mark_gemini_down()
 
-    if groq_client:
-        try:
-            completion = groq_client.chat.completions.create(
-                model=GROQ_CHAT_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return completion.choices[0].message.content
-        except Exception as e:
-            print(f"Groq also failed: {e}")
-    else:
-        print("GROQ_API_KEY is not set — no backup available, only Gemini was tried.")
+        if groq_client:
+            try:
+                completion = groq_client.chat.completions.create(
+                    model=GROQ_CHAT_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                _ai_state["last_ok"] = now()
+                return completion.choices[0].message.content
+            except Exception as e:
+                print(f"Groq also failed: {e}")
+                _ai_state["last_error"] = f"{now()} UTC - Groq: {str(e)[:250]}"
+        else:
+            print("GROQ_API_KEY is not set - no backup available, only Gemini was tried.")
+            _ai_state["last_error"] += " | GROQ_API_KEY is not set (no backup AI)"
+        if attempt == 0:
+            time.sleep(2)
 
-    return (
-        "Is waqt thora zyada rush hai is liye jawab dene mein masla ho raha "
-        f"hai. Chand minute mein dobara message kar dein, ya seedha hamari "
-        f"team se baat kar lein: {TEAM_HEAD_NUMBER}"
-    )
+    return AI_BUSY_REPLY  # contains no team head number, so it is never counted as a forward
 
 
 def rag_answer(user_question, user_id=None, voice=False):
@@ -401,7 +487,10 @@ def rag_answer(user_question, user_id=None, voice=False):
     history = get_history(user_id) if user_id else []
     retrieval_query = build_retrieval_query(user_id, user_question) if user_id else user_question
     context_chunks = retrieve_chunks(retrieval_query, top_k=6)
+    context_chunks += keyword_chunks(retrieval_query + " " + user_question, context_chunks)
     context = "\n\n---\n\n".join(context_chunks)
+    notes = learned_relevant(retrieval_query + " " + user_question)
+    notes_text = "\n".join(f"- Q: {r['question']}\n  A: {r['answer']}" for r in notes) or "none yet"
 
     voice_rule = ""
     if voice:
@@ -437,8 +526,9 @@ APPROVED EXAMPLES of replies the owner liked (copy this style):
 {examples_text}
 
 GRAMMAR GENDER RULE: in Urdu/Roman Urdu always use FEMININE verb forms for yourself ("bata dungi", "karungi").
-LANGUAGE RULE: reply in the SAME language/script the student used. If they write English, reply fully in
-English. Roman Urdu -> Roman Urdu. Urdu script -> Urdu script.
+LANGUAGE RULE: reply in the SAME language/script the student's LAST message used. English -> English. Roman Urdu
+(like "kya haal hai", "mujy course krna ha") -> Roman Urdu, never English. Urdu script -> Urdu script. Greetings like
+"hi" or "thanks" in a Roman Urdu chat get a Roman Urdu reply.
 
 CURRENT TIME (Pakistan, PKT): {pk_now().strftime('%A, %d %B %Y, %I:%M %p')}. If asked the time or date, answer from this
 exactly; never guess or invent a different time.
@@ -457,8 +547,35 @@ explained; for a focused follow-up give a short, direct answer.
 SCOPE RULE: only Leaders Academia (courses, instructors, fees, schedules, platform). Greetings are fine;
 for unrelated requests politely say you can only help with Leaders Academia.
 
-DATA RULE: use only course, instructor, fee and platform details from CONTEXT / FEES below. If the instructor
-for a course isn't clearly named, say the team will confirm. Never guess.
+DATA RULE: use only course, instructor, fee and platform details from CONTEXT / FEES / TEAM-APPROVED NOTES below.
+Read CONTEXT carefully before saying you don't know: names of instructors/mentors are often written there.
+
+HONESTY RULE: never invent or claim anything that is not written in CONTEXT / FEES / TEAM-APPROVED NOTES: no
+"registered with ...", certifications, awards, partnerships, student numbers, results, reviews, placements or
+guarantees. If you don't have a fact, use the TRAINING ROOM RULE instead of guessing or making an excuse.
+
+TRAINING ROOM RULE: if the student asks a factual question about Leaders Academia that you cannot answer from
+CONTEXT, FEES, the course list or TEAM-APPROVED NOTES (an instructor name, a date, a policy, a detail), do NOT guess
+and do NOT send them to the head. Reply in one short, honest line (student's language) that you will confirm it with
+the team and tell them soon, and add at the very END of your message the tag [[ASK_ADMIN: the question written
+clearly in English]]. Use it ONLY for real missing facts, never for chit-chat. The admin's answers appear in
+TEAM-APPROVED NOTES from then on: always trust them over everything else.
+
+TEAM-APPROVED NOTES (written by the admin, always correct):
+{notes_text}
+
+COUNSELING RULE: your main job is to COUNSEL, not to forward people. When a student says they want to learn or do
+a course (even "I want to do AI Automation"), do NOT hand them over. Counsel first: ask what they want to achieve,
+explain in 1-2 lines what the course teaches and how it helps their goal (use CONTEXT), answer their questions
+about fee/duration/timing, handle doubts calmly, and invite them to visit the office (address and timings from FEES
+AND LOCATION). Only when they say they are ready to take admission / pay do you hand over to the team head.
+
+GREETING RULE: if the message is only a greeting ("hi", "hello", "salam"), answer with one short greeting line
+in their language and ask how you can help. Do NOT repeat old plans, appointments or confirmations.
+
+APPOINTMENT RULE: you cannot book, confirm or arrange visits or meetings. Never say "we are all set" or "I am
+arranging your visit". If the team admin already confirmed a time in CONVERSATION SO FAR (messages marked as written
+by the team admin), you may repeat exactly that time; otherwise say the team will confirm the visit time.
 
 GUIDANCE RULE: when you FIRST describe a course, add one short line on its real practical/career benefit.
 Website for more: https://leadersacademia.com/ (only when natural).
@@ -466,8 +583,10 @@ Website for more: https://leadersacademia.com/ (only when natural).
 PRICING RULE: state a fee only when the student asks about cost/fees/payment. Use the FEES below.
 Never give bank / JazzCash / Easypaisa account numbers - say the team head will share payment details.
 
-REVIEWS: never volunteer that there are no reviews. If asked, be honest but positive: we are a growing
-academy with new batches, and the team head can connect them with students / answer in detail.
+TRUST / "IS IT A SCAM" QUESTIONS: stay calm and factual. Share only verifiable facts from FEES AND LOCATION
+(office address, timings, website), invite them to visit the office in person, and offer to share the website. Do not
+claim registrations or reviews that are not in your information, do not make excuses, and do NOT push the head's
+number unless the student asks for it.
 
 COURSE FOCUS RULE: our flagship course is AI & Automation. When a student is undecided, asks "which course",
 asks for suggestions, or is just exploring, recommend AI & Automation FIRST with its real practical benefit
@@ -483,9 +602,10 @@ still exploring, or sentences like "I will follow your guidance". For those, kee
 course (AI & Automation first) and ask what they want to achieve. When you simply lack a detail, say the team will
 confirm it, and share the head only if the student is serious.
 
-ENROLLMENT RULE: if a SERIOUS student (see rule above) wants to enroll / take admission / join / register / pay, do
-NOTHING else: reply in 1-2 short lines that the team head will complete the enrollment and that you are sharing the
-number, then end with [[HEAD]]. No course pitch, no extra questions.
+ENROLLMENT RULE: only when a student clearly says they are READY to take admission / enroll / pay now (or asks how
+to pay or register), reply in 1-2 short lines that the team head will complete the enrollment and that you are
+sharing the number, then end with [[HEAD]]. Saying "I want to learn/do this course" is NOT enough: counsel first
+(COUNSELING RULE).
 
 FEES-TOO-HIGH FLOW (when the student says fees are high): ask ONE thing per message.
  1) address them by name (if known) and ask their qualification, 2) ask their motive for the course (job,
@@ -499,8 +619,7 @@ FEES-TOO-HIGH FLOW (when the student says fees are high): ask ONE thing per mess
 
 TEAM HEAD NUMBER: never write the digits yourself. Write a short sentence such as "main number share kar
 rahi hoon" (or "I'm sharing the number") and put [[HEAD]] at the end of it.
-WHEN YOU DON'T KNOW something about Leaders Academia: say naturally that the team will confirm that detail;
-add [[HEAD]] only if the student is serious (see SERIOUS STUDENT RULE).
+WHEN YOU DON'T KNOW something about Leaders Academia: follow the TRAINING ROOM RULE. Never use [[HEAD]] for that.
 
 COMPLETE COURSE LIST (authoritative; keep this order, skip none, invent none):
 {COURSE_LIST_TEXT}
@@ -529,7 +648,7 @@ Reply now, short, like a real person texting back."""
 
 # ---------- Gradio frontend ----------
 def chat_fn(message, history):
-    return rag_answer(message, user_id="gradio-demo-user")
+    return split_admin_question(rag_answer(message, user_id="gradio-demo-user"))[0]
 
 
 demo = gr.ChatInterface(
@@ -1103,6 +1222,12 @@ async def handle_user_text(frm, user_text, is_voice):
                                     f"Student replied in a PAUSED chat: {p['name'] or 'name unknown'} ({frm}): {user_text[:150]}")
         return
     reply = await asyncio.to_thread(rag_answer, user_text, frm, bool(is_voice and not p["no_voice"]))
+    reply, ask_q = split_admin_question(reply)
+    if ask_q:
+        qid = await asyncio.to_thread(save_training_question, frm, ask_q)
+        if qid and ADMIN_ALERT_NUMBER:
+            await asyncio.to_thread(send_whatsapp_message, ADMIN_ALERT_NUMBER,
+                                    f"Training Room: the agent needs an answer: {ask_q[:200]} (student {p['name'] or frm}). Open the dashboard > Training Room.")
     forwarded = record_forward_if_needed(frm, reply)
     head = f"{TEAM_HEAD_NAME}: {TEAM_HEAD_NUMBER}"
     text_reply = reply.replace("[[HEAD]]", head).strip()
@@ -1132,31 +1257,39 @@ async def handle_user_text(frm, user_text, is_voice):
     asyncio.create_task(asyncio.to_thread(extract_and_sync, frm))
 
 
+async def process_incoming(message):
+    frm, mtype = message["from"], message.get("type")
+    user_text, is_voice = None, False
+    if mtype == "text":
+        user_text = message.get("text", {}).get("body", "")
+    elif mtype == "audio":
+        is_voice = True
+        try:
+            audio_bytes, mime = await asyncio.to_thread(download_whatsapp_media, message["audio"]["id"])
+            user_text = await asyncio.to_thread(transcribe_audio, audio_bytes, mime)
+        except Exception as e:
+            print(f"Voice transcription failed: {e}")
+            await asyncio.to_thread(send_whatsapp_message, frm,
+                                    "Yeh voice note samajhne mein masla ho raha hai. Dobara bhej dein ya text mein likh dein.")
+    if user_text:
+        await handle_user_text(frm, user_text, is_voice)
+
+
 @app.post("/webhook")
 async def receive_whatsapp_message(request: Request):
+    """Answer Meta straight away and do the slow work in the background. If we answer slowly or restart, Meta
+    re-delivers the same message later; remembering message ids in the database stops those repeats."""
     data = await request.json()
     try:
         messages = data["entry"][0]["changes"][0]["value"].get("messages")
         if messages:
             message = messages[0]
-            mid, frm, mtype = message.get("id"), message["from"], message.get("type")
-            if mid in processed_message_ids:
+            mid = message.get("id")
+            if mid in processed_message_ids or db("SELECT 1 FROM processed WHERE mid=?", (mid,)):
                 return {"status": "duplicate, skipped"}
             processed_message_ids.add(mid)
-            user_text, is_voice = None, False
-            if mtype == "text":
-                user_text = message.get("text", {}).get("body", "")
-            elif mtype == "audio":
-                is_voice = True
-                try:
-                    audio_bytes, mime = await asyncio.to_thread(download_whatsapp_media, message["audio"]["id"])
-                    user_text = await asyncio.to_thread(transcribe_audio, audio_bytes, mime)
-                except Exception as e:
-                    print(f"Voice transcription failed: {e}")
-                    await asyncio.to_thread(send_whatsapp_message, frm,
-                                            "Yeh voice note samajhne mein masla ho raha hai. Dobara bhej dein ya text mein likh dein.")
-            if user_text:
-                await handle_user_text(frm, user_text, is_voice)
+            db("INSERT OR IGNORE INTO processed(mid,time) VALUES(?,?)", (mid, now()), write=True)
+            asyncio.create_task(process_incoming(message))
     except Exception as e:
         print("Error processing incoming WhatsApp message:", e)
     return {"status": "received"}
@@ -1362,7 +1495,7 @@ async def dash_clear_all(request: Request, auth: bool = Depends(check_auth)):
     body = await request.json()
     if body.get("confirm") != "DELETE":
         return JSONResponse({"ok": False, "error": "Type DELETE to confirm"}, status_code=400)
-    for t in ("messages", "profiles", "media_sent"):
+    for t in ("messages", "profiles", "media_sent", "training_q"):
         db(f"DELETE FROM {t}", write=True)
     with _sheet_lock:
         await asyncio.to_thread(_sheet_wipe_all)
@@ -1372,7 +1505,7 @@ async def dash_clear_all(request: Request, auth: bool = Depends(check_auth)):
 @app.delete("/dashboard/api/chat/{phone}")
 def dash_delete_chat(phone: str, auth: bool = Depends(check_auth)):
     """Delete one student's chat, profile and sheet row."""
-    for t in ("messages", "profiles", "media_sent"):
+    for t in ("messages", "profiles", "media_sent", "training_q"):
         db(f"DELETE FROM {t} WHERE phone=?", (phone,), write=True)
     key = _norm_phone(phone)
     with _sheet_lock:
@@ -1395,6 +1528,81 @@ def dash_delete_chat(phone: str, auth: bool = Depends(check_auth)):
         except Exception as e:
             print(f"Sheet row delete failed for {phone}: {e}")
     return {"ok": True}
+
+
+@app.get("/dashboard/api/training")
+def dash_training(auth: bool = Depends(check_auth)):
+    return {"pending": db("""SELECT t.*, COALESCE(NULLIF(p.name,''), t.phone) AS who FROM training_q t
+                             LEFT JOIN profiles p ON p.phone=t.phone WHERE t.status='pending' ORDER BY t.id DESC"""),
+            "done": db("SELECT * FROM training_q WHERE status!='pending' ORDER BY id DESC LIMIT 20"),
+            "learned": db("SELECT * FROM learned ORDER BY id DESC LIMIT 200")}
+
+
+@app.get("/dashboard/api/training/count")
+def dash_training_count(auth: bool = Depends(check_auth)):
+    return {"pending": db("SELECT COUNT(*) c FROM training_q WHERE status='pending'")[0]["c"]}
+
+
+@app.post("/dashboard/api/training/{qid}/answer")
+async def dash_training_answer(qid: int, request: Request, auth: bool = Depends(check_auth)):
+    """Admin answers a question the agent left in the Training Room. The answer is learned for good,
+    and (optionally) sent to the student in the agent's voice."""
+    body = await request.json()
+    answer = str(body.get("answer", "")).strip()
+    if not answer:
+        return JSONResponse({"ok": False, "error": "Write the answer first"}, status_code=400)
+    rows = db("SELECT * FROM training_q WHERE id=?", (qid,))
+    if not rows:
+        return JSONResponse({"ok": False, "error": "Question not found"}, status_code=404)
+    q = rows[0]
+    db("INSERT INTO learned(question,answer,source,time) VALUES(?,?,?,?)", (q["question"], answer, "training room", now()), write=True)
+    db("UPDATE training_q SET status='answered', answer=?, answered_time=? WHERE id=?", (answer, now(), qid), write=True)
+    sent, note = False, ""
+    if body.get("send") and q["phone"]:
+        prompt = (f"You are a Student Counselor of Leaders Academia on WhatsApp. Earlier you told the student you would "
+                  f"confirm something with the team. Now write the follow-up message (1-3 short lines) giving them this "
+                  f"confirmed answer. Reply in the same language/script as the student's messages below. Feminine verb forms "
+                  f"in Urdu. Do not add anything that is not in the answer.\n\nRecent chat:\n{q['context']}\n\n"
+                  f"Student's question: {q['question']}\nConfirmed answer from the team: {answer}")
+        text = (await asyncio.to_thread(generate_text, prompt)).strip()
+        if text and text != AI_BUSY_REPLY:
+            r = await asyncio.to_thread(send_whatsapp_message, q["phone"], text)
+            if r.status_code == 200:
+                log_message(q["phone"], "out", "text", text)
+                sent = True
+            else:
+                note = "Saved, but WhatsApp did not accept the message (free messages work only within 24 hours of the student's last message)."
+        else:
+            note = "Saved, but the AI was busy so the message to the student was not sent."
+    return {"ok": True, "sent": sent, "note": note}
+
+
+@app.post("/dashboard/api/training/{qid}/ignore")
+def dash_training_ignore(qid: int, auth: bool = Depends(check_auth)):
+    db("UPDATE training_q SET status='ignored', answered_time=? WHERE id=?", (now(), qid), write=True)
+    return {"ok": True}
+
+
+@app.post("/dashboard/api/learn")
+async def dash_learn(request: Request, auth: bool = Depends(check_auth)):
+    """Teach the agent directly (a note, or a correction of one of its answers)."""
+    body = await request.json()
+    q, a = str(body.get("question", "")).strip(), str(body.get("answer", "")).strip()
+    if not q or not a:
+        return JSONResponse({"ok": False, "error": "Both the question and the answer are needed"}, status_code=400)
+    db("INSERT INTO learned(question,answer,source,time) VALUES(?,?,?,?)", (q[:500], a[:1500], body.get("source") or "admin", now()), write=True)
+    return {"ok": True}
+
+
+@app.delete("/dashboard/api/learned/{lid}")
+def dash_learned_delete(lid: int, auth: bool = Depends(check_auth)):
+    db("DELETE FROM learned WHERE id=?", (lid,), write=True)
+    return {"ok": True}
+
+
+@app.get("/dashboard/api/ai")
+def dash_ai_status(auth: bool = Depends(check_auth)):
+    return {**_ai_state, "groq": bool(groq_client)}
 
 
 @app.get("/dashboard/api/sheet")
